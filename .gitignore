@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Data dumps: ignore contents under data/, keep directory placeholders
+data/**
+!data/**/
+!data/**/.gitkeep
+*.parquet
+*.feather
+
+# Large tabular dumps outside kept placeholders
+*.csv
+!docs/**/*.csv
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
