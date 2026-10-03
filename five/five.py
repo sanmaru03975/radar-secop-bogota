@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
     "autostart": "true",
     "ask_task": "true",
     "schedule": "weekdays 21:00 Rutina de la noche",
+    "voice": "true",
 }
 
 # The explanation written above each setting in config.txt
@@ -62,6 +63,9 @@ SETTING_HELP = {
                  "# TIME: 24-hour clock, 21:00 = 9 pm. You can add more schedule= lines.",
                  "# If the computer was off or asleep, it still runs up to 30 minutes late.",
                  "# schedule=off turns it off."],
+    "voice": ["# true = play your own voice during the countdown",
+              "# (record it first: right-click the 5 icon > Record my voice)",
+              "# false = silent countdown. If you never recorded, nothing plays."],
 }
 
 WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -459,6 +463,133 @@ def open_stats_window():
 
 
 # --------------------------------------------------------------------------
+# Countdown in your own voice (voice.wav, recorded with tray > Record my voice)
+# --------------------------------------------------------------------------
+
+VOICE_FILE = APP_DIR / "voice.wav"
+VOICE_EXTRA_SECONDS = 1.5  # recording lasts countdown_seconds + this (room for "GO!")
+MIC_ERROR_TEXT = ("Couldn't use the microphone. Check that one is connected and that "
+                  "Windows allows apps to use it: Settings > Privacy > Microphone.")
+
+_voice_proc = None  # Linux only: the aplay/paplay process that is playing
+
+
+def _find_program(*names):
+    import shutil
+    for name in names:
+        if shutil.which(name):
+            return name
+    return None
+
+
+def play_voice(path=None):
+    """Start playing voice.wav in the background. Never blocks, never raises."""
+    global _voice_proc
+    path = Path(path or VOICE_FILE)
+    try:
+        if not path.is_file():
+            return False
+        if IS_WINDOWS:
+            import winsound  # a new async sound replaces the one playing
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC
+                               | winsound.SND_NODEFAULT)
+            return True
+        player = _find_program("aplay", "paplay")
+        if player is None:
+            return False
+        stop_voice()
+        cmd = [player, "-q", str(path)] if player == "aplay" else [player, str(path)]
+        _voice_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        log_error("Playing voice.wav failed:\n" + traceback.format_exc())
+        return False
+
+
+def stop_voice():
+    """Stop voice.wav if it is playing. Never raises."""
+    global _voice_proc
+    try:
+        if IS_WINDOWS:
+            import winsound
+            winsound.PlaySound(None, 0)  # None = stop whatever is playing
+        elif _voice_proc is not None:
+            if _voice_proc.poll() is None:
+                _voice_proc.terminate()
+            _voice_proc = None
+    except Exception:
+        log_error("Stopping voice.wav failed:\n" + traceback.format_exc())
+
+
+class MciError(Exception):
+    pass
+
+
+def mci_send(command):
+    """Send one command to the Windows MCI audio API. Raises MciError on failure."""
+    import ctypes
+    winmm = ctypes.windll.winmm
+    code = winmm.mciSendStringW(command, None, 0, None)
+    if code != 0:
+        buf = ctypes.create_unicode_buffer(256)
+        try:
+            winmm.mciGetErrorStringW(code, buf, 256)
+            text = buf.value
+        except Exception:
+            text = ""
+        raise MciError(f"{command!r} failed ({code}): {text or 'unknown error'}")
+
+
+def short_path(path):
+    """The old-style 8.3 path (no spaces) of an existing folder or file, or None."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 1024)
+        return buf.value if 0 < n < 1024 else None
+    except Exception:
+        return None
+
+
+def mci_save_recording(alias, name):
+    """Save the MCI recording to a file called `name`, trying a few folders because
+    MCI dislikes some paths. Returns the Path of the saved file. Raises MciError."""
+    import tempfile
+    candidates = []
+    for folder in (APP_DIR, Path(tempfile.gettempdir())):
+        candidates.append(folder / name)
+        short = short_path(folder)
+        if short:
+            candidates.append(Path(short) / name)
+    errors = []
+    for target in dict.fromkeys(candidates):
+        try:
+            if target.exists():
+                target.unlink()
+            mci_send(f'save {alias} "{target}"')
+            if target.is_file() and target.stat().st_size > 44:  # more than a WAV header
+                return target
+            errors.append(f"{target}: file missing or empty")
+        except (MciError, OSError) as exc:
+            errors.append(str(exc))
+    raise MciError("Could not save the recording:\n" + "\n".join(errors))
+
+
+def install_voice_file(new_file):
+    """Replace voice.wav with `new_file` only now that the new recording is good."""
+    import shutil
+    new_file = Path(new_file)
+    staged = APP_DIR / "voice.wav.new"
+    if new_file.resolve() != staged.resolve():
+        shutil.copyfile(new_file, staged)
+        try:
+            new_file.unlink()
+        except OSError:
+            pass
+    os.replace(staged, VOICE_FILE)
+
+
+# --------------------------------------------------------------------------
 # Only one copy of Five may run at a time
 # --------------------------------------------------------------------------
 
@@ -598,6 +729,7 @@ def start_tray(events):
     menu = pystray.Menu(
         pystray.MenuItem("Open stats", lambda: events.put("stats")),
         pystray.MenuItem("Edit actions", lambda: events.put("edit")),
+        pystray.MenuItem("Record my voice", lambda: events.put("voice")),
         pystray.MenuItem("Update Five", lambda: events.put("update")),
         pystray.MenuItem("Quit", lambda: events.put("quit")),
     )
@@ -676,6 +808,8 @@ class FiveApp:
                         return
                 elif event == "edit":
                     open_file(ACTIONS_FILE)
+                elif event == "voice":
+                    self.open_voice_recorder()
                 elif event == "quit":
                     self.quit()
                     return
@@ -841,7 +975,26 @@ class FiveApp:
 
     def start_countdown(self):
         self.asking = False
+        self.start_voice()
         self.tick(config_seconds(self.config))
+
+    def start_voice(self):
+        """Play voice.wav with the countdown, if you recorded one and voice=true."""
+        self.voice_playing = False
+        try:
+            if config_bool(self.config, "voice") and VOICE_FILE.is_file():
+                self.voice_playing = play_voice(VOICE_FILE)
+        except Exception:
+            log_error(traceback.format_exc())
+
+    def open_voice_recorder(self):
+        recorder = getattr(self, "voice_recorder", None)
+        if recorder is not None and recorder.win is not None:
+            recorder.win.deiconify()
+            recorder.win.lift()
+            recorder.win.focus_force()
+            return
+        self.voice_recorder = VoiceRecorder(self.root)
 
     def _grab_focus(self):
         w = self.window
@@ -886,6 +1039,9 @@ class FiveApp:
         if self.window is None or self.closed:
             return
         self.closed = True
+        if getattr(self, "voice_playing", False):
+            self.voice_playing = False
+            stop_voice()
         if getattr(self, "asking", False):  # cancelled before starting: nothing to log
             self.window.destroy()
             self.window = None
@@ -894,6 +1050,266 @@ class FiveApp:
         append_log(result, self.action or "(closed during countdown)")
         self.window.destroy()
         self.window = None
+
+
+# --------------------------------------------------------------------------
+# "Record my voice" window
+# --------------------------------------------------------------------------
+
+class VoiceRecorder:
+    """Small window that records voice.wav while showing 5, 4, 3, 2, 1, GO!
+    at the same pace as the real countdown, so your voice lines up with it."""
+
+    WIDTH, HEIGHT = 600, 400
+    MCI_ALIAS = "fiverec"
+    NEW_NAME = "five_voice_new.wav"
+
+    def __init__(self, root):
+        import tkinter as tk
+        self.tk = tk
+        self.root = root
+        self.recording = False
+        self.token = 0          # bumped on close, so pending timers do nothing
+        self.mci_open = False
+        self.proc = None        # Linux: the arecord process
+        self.linux_file = None
+
+        w = tk.Toplevel(root, bg=BG)
+        self.win = w
+        w.title("Five - Record my voice")
+        x = max(0, (w.winfo_screenwidth() - self.WIDTH) // 2)
+        y = max(0, (w.winfo_screenheight() - self.HEIGHT) // 2)
+        w.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+        w.resizable(False, False)
+        w.attributes("-topmost", True)
+
+        tk.Label(w, text="Countdown in your own voice", font=(FONT, 20, "bold"),
+                 fg=ACCENT, bg=BG).pack(pady=(22, 6))
+        tk.Label(w, text="Press Record. Then say the numbers as they appear: 5, 4, 3, 2, 1, GO!",
+                 font=(FONT, 12), fg=FG, bg=BG, wraplength=570, justify="center").pack()
+        self.big = tk.Label(w, text="", font=(FONT, 80, "bold"), fg=FG, bg=BG)
+        self.big.pack(expand=True)
+        self.status = tk.Label(w, text="", font=(FONT, 11), fg="#888888", bg=BG,
+                               wraplength=560, justify="center")
+        self.status.pack(pady=(0, 10))
+
+        buttons = tk.Frame(w, bg=BG)
+        buttons.pack(pady=(0, 22))
+        self.record_button = self._button(buttons, "Record", self.record, primary=True)
+        self.play_button = self._button(buttons, "Play", self.play)
+        self.close_button = self._button(buttons, "Close", self.close)
+        for b in (self.record_button, self.play_button, self.close_button):
+            b.pack(side="left", padx=8)
+
+        w.protocol("WM_DELETE_WINDOW", self.close)
+        w.bind("<Escape>", lambda e: self.close())
+        self._set_idle_status()
+        w.lift()
+        w.focus_force()
+
+    def _button(self, parent, text, command, primary=False):
+        return self.tk.Button(parent, text=text, command=command, relief="flat", cursor="hand2",
+                              font=(FONT, 14, "bold" if primary else "normal"), width=8,
+                              fg=BG if primary else FG, bg=ACCENT if primary else "#262626",
+                              activebackground=FG, activeforeground=BG, padx=10, pady=6)
+
+    def _set_idle_status(self):
+        if VOICE_FILE.is_file():
+            self.status.config(text="You have a recording. Press Play to listen, or Record to redo it.")
+        else:
+            self.status.config(text="No recording yet.")
+
+    def _alive(self, token):
+        return self.win is not None and token == self.token
+
+    def _set_buttons(self, enabled):
+        state = "normal" if enabled else "disabled"
+        self.record_button.config(state=state)
+        self.play_button.config(state=state)
+
+    # ---- buttons ----
+
+    def play(self):
+        if self.recording:
+            return
+        if not VOICE_FILE.is_file():
+            self.status.config(text="No recording yet. Press Record first.")
+            return
+        if play_voice(VOICE_FILE):
+            self.status.config(text="Playing...")
+        else:
+            self.status.config(text="Couldn't play the recording on this computer.")
+
+    def record(self):
+        if self.recording or self.win is None:
+            return
+        stop_voice()  # don't record our own playback
+        self.seconds = config_seconds(load_config())
+        try:
+            if not self._prepare():
+                return
+        except Exception as exc:
+            self._fail(exc)
+            return
+        self.recording = True
+        self._set_buttons(False)
+        self.big.config(text="Get ready...", fg="#888888", font=(FONT, 40, "bold"))
+        self.status.config(text="Say each number when it appears.")
+        token = self.token
+        self.win.after(1000, self._begin, token)
+
+    def close(self):
+        if self.win is None:
+            return
+        self.token += 1
+        if self.recording:
+            self._abort()
+        stop_voice()
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        self.win = None
+
+    # ---- the recording itself ----
+
+    def _begin(self, token):
+        if not self._alive(token):
+            return
+        try:
+            self._start()
+        except Exception as exc:
+            self._fail(exc)
+            return
+        # Same pace as the real countdown: one number per second, then GO!
+        for i in range(self.seconds):
+            self.win.after(i * 1000, self._show, token, str(self.seconds - i), FG)
+        self.win.after(self.seconds * 1000, self._show, token, "GO!", ACCENT)
+        self.win.after(int((self.seconds + VOICE_EXTRA_SECONDS) * 1000), self._finish, token)
+
+    def _show(self, token, text, color):
+        if self._alive(token):
+            self.big.config(text=text, fg=color, font=(FONT, 120, "bold"))
+
+    def _finish(self, token):
+        if not self._alive(token):
+            return
+        if not IS_WINDOWS and self.proc is not None and self.proc.poll() is None:
+            # arecord stops by itself at a whole second; give it a moment
+            waited = getattr(self, "_waited", 0)
+            if waited < 3000:
+                self._waited = waited + 100
+                self.win.after(100, self._finish, token)
+                return
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
+        self._waited = 0
+        try:
+            saved = self._stop_and_save()
+            install_voice_file(saved)
+        except Exception as exc:
+            self._fail(exc)
+            return
+        self.recording = False
+        self._set_buttons(True)
+        self.big.config(text="Saved", fg=ACCENT, font=(FONT, 60, "bold"))
+        self.status.config(text="Saved. Press Play to listen. It plays with every countdown now.")
+
+    def _fail(self, exc):
+        """Something went wrong: tell the user, keep the old voice.wav."""
+        log_error(f"Voice recording failed: {exc}\n" + traceback.format_exc())
+        if self.recording or self.mci_open or self.proc is not None:
+            self._abort()
+        self.recording = False
+        if self.win is None:
+            return
+        self._set_buttons(True)
+        self.big.config(text="", fg=FG)
+        self._set_idle_status()
+        from tkinter import messagebox
+        messagebox.showerror("Five", MIC_ERROR_TEXT, parent=self.win)
+
+    # ---- Windows (MCI) and Linux (arecord, for testing) ----
+
+    def _prepare(self):
+        """Open the microphone. Returns False if recording isn't possible here."""
+        if IS_WINDOWS:
+            try:
+                mci_send(f"close {self.MCI_ALIAS}")  # leftover from a crash, if any
+            except MciError:
+                pass
+            mci_send(f"open new type waveaudio alias {self.MCI_ALIAS}")
+            self.mci_open = True
+            try:
+                mci_send(f"set {self.MCI_ALIAS} bitspersample 16 samplespersec 44100 channels 1")
+            except MciError as exc:  # the defaults are fine too
+                log_error(f"Voice recording: using default quality ({exc})")
+            return True
+        if _find_program("arecord") is None:
+            from tkinter import messagebox
+            messagebox.showinfo("Five", "Recording only works on Windows.", parent=self.win)
+            return False
+        return True
+
+    def _start(self):
+        if IS_WINDOWS:
+            mci_send(f"record {self.MCI_ALIAS}")
+            return
+        import math
+        import tempfile
+        self.linux_file = Path(tempfile.gettempdir()) / self.NEW_NAME
+        seconds = math.ceil(self.seconds + VOICE_EXTRA_SECONDS)
+        self.proc = subprocess.Popen(["arecord", "-q", "-d", str(seconds), "-f", "cd",
+                                      str(self.linux_file)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    def _stop_and_save(self):
+        """Stop recording and return the Path of the new (temporary) file."""
+        if IS_WINDOWS:
+            try:
+                mci_send(f"stop {self.MCI_ALIAS}")
+                return mci_save_recording(self.MCI_ALIAS, self.NEW_NAME)
+            finally:
+                self._close_mci()
+        proc, self.proc = self.proc, None
+        err = b""
+        try:
+            err = proc.stderr.read() if proc.stderr else b""
+        except Exception:
+            pass
+        if proc.returncode not in (0, None) and not (self.linux_file and self.linux_file.is_file()):
+            raise RuntimeError(f"arecord failed ({proc.returncode}): {err.decode(errors='replace')}")
+        if not self.linux_file.is_file() or self.linux_file.stat().st_size <= 44:
+            raise RuntimeError(f"arecord made no sound file: {err.decode(errors='replace')}")
+        return self.linux_file
+
+    def _close_mci(self):
+        if self.mci_open:
+            self.mci_open = False
+            try:
+                mci_send(f"close {self.MCI_ALIAS}")
+            except MciError as exc:
+                log_error(f"Voice recording: {exc}")
+
+    def _abort(self):
+        """Stop recording without saving (window closed or an error)."""
+        if IS_WINDOWS:
+            if self.mci_open:
+                try:
+                    mci_send(f"stop {self.MCI_ALIAS}")
+                except Exception:
+                    pass
+            self._close_mci()
+        elif self.proc is not None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+            self.proc = None
+        self.recording = False
 
 
 # --------------------------------------------------------------------------

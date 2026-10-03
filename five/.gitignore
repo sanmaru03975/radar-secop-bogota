@@ -2,3 +2,5 @@ log.csv
 five_error.log
 __pycache__/
 five.py.bak
+voice.wav
+voice.wav.new
