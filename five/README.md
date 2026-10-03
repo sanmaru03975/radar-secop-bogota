@@ -58,6 +58,26 @@ A partir de ahí, **Five se abre solo cada vez que prendes Windows**.
   Los cambios de `hotkey` y `autostart` necesitan reiniciar Five (clic derecho en el
   ícono → **Quit** y después doble clic en `run.bat`). Los demás funcionan desde la siguiente cuenta regresiva.
 
+## Funciones de la versión 1.5
+
+- **Radar de procrastinación:** si pasas 10 minutos seguidos en YouTube, Instagram, TikTok, Netflix,
+  Facebook, Twitter o Reddit, Five se abre solo y te dice cuánto tiempo llevas ahí.
+  Ajustes: `radar_sites` (las páginas) y `radar_minutes` (los minutos; `0` = apagado).
+- **Sigue así (momentum):** después de **Done** aparece una cajita abajo a la derecha:
+  *"Keep going: 10:00"*. Ajuste: `momentum_minutes` (`0` = apagado).
+- **Primer paso mínimo:** en GO ves *"First tiny step: ..."*. En `actions.txt` puedes darle a cada acción
+  su propio primer paso después de una `|`, por ejemplo: `Go to the gym | Put on your shoes. That's it.`
+  Si no tiene, usa `default_tiny_step`.
+- **Tu voz:** clic derecho en el ícono **5** → **Record my voice** → **Record** y di los números a medida
+  que aparecen. Desde ahí la cuenta regresiva suena con tu voz. Ajuste: `voice` (`false` = sin sonido).
+- **Mensaje y foto de tu yo del futuro:** se muestran durante la cuenta regresiva.
+  Mensaje: `future_message=Santi, you promised.` Foto: clic derecho en el **5** → **Set future photo**.
+- **Alcancía de multas:** cada **Esc** (saltar) suma `fine_amount` (por defecto 1.000 CLP).
+  Clic derecho en el **5** → **Fine jar** para ver cuánto debes y marcar **I paid it**.
+  Si pones tu propio enlace de pago en `pay_link` (Mercado Pago, PayPal, una donación...), aparece el
+  botón **Pay now**, que lo abre en tu navegador. **Five nunca pide ni guarda tu tarjeta:** pagas en la
+  página segura de esa empresa.
+
 ## Cómo actualizar Five
 
 1. Descarga el nuevo `Five.zip` (déjalo en **Descargas**, no hace falta extraerlo).
@@ -70,6 +90,8 @@ Guarda una copia de la versión anterior como `five.py.bak`, por si acaso.
 ## Archivos que crea Five
 
 - **`log.csv`**: tu historial (fecha, hora, resultado y acción). Se abre con Excel.
+- **`fines.csv`**: tus multas y pagos de la alcancía.
+- **`voice.wav`**: tu voz grabada. **`future.png`/`future.jpg`**: tu foto del futuro.
 - **`five_error.log`**: solo aparece si algo falla. Sirve para pedir ayuda.
 
 ## Estadísticas desde la terminal (opcional)

@@ -34,7 +34,7 @@ FINES_FILE = APP_DIR / "fines.csv"  # the fine jar: what you owe for skipping
 IS_WINDOWS = sys.platform == "win32"
 
 # Bump this every time a new Five.zip is sent, so "Update Five" knows it is newer
-VERSION = "1.4"
+VERSION = "1.5"
 
 # Files that "Update Five" may replace. Your actions.txt, config.txt and
 # log.csv are never touched.
@@ -1545,6 +1545,11 @@ class FiveApp:
         t.update_idletasks()
         x = t.winfo_screenwidth() - t.winfo_reqwidth() - 24
         y = t.winfo_screenheight() - t.winfo_reqheight() - 64  # above the taskbar
+        if self.momentum is not None:  # don't cover the "Keep going" box
+            try:
+                y = min(y, self.momentum.winfo_rooty() - t.winfo_reqheight() - 12)
+            except Exception:
+                pass
         t.geometry(f"+{x}+{y}")
         if IS_WINDOWS:
             try:  # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW: no focus, no taskbar button
