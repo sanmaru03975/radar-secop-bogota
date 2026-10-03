@@ -29,6 +29,7 @@ ACTIONS_FILE = APP_DIR / "actions.txt"
 CONFIG_FILE = APP_DIR / "config.txt"
 LOG_FILE = APP_DIR / "log.csv"
 ERROR_FILE = APP_DIR / "five_error.log"
+FINES_FILE = APP_DIR / "fines.csv"  # the fine jar: what you owe for skipping
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -48,6 +49,9 @@ DEFAULT_CONFIG = {
     "schedule": "weekdays 21:00 Rutina de la noche",
     "default_tiny_step": "Just do the first 2 minutes. Nothing else.",
     "future_message": "",
+    "fine_amount": "1000",
+    "fine_currency": "CLP",
+    "pay_link": "",
 }
 
 # The explanation written above each setting in config.txt
@@ -72,6 +76,14 @@ SETTING_HELP = {
                        "# Example: future_message=Santi, you promised. Do it for future you.",
                        "# Leave it empty for no message. To also show a photo, use the tray",
                        "# icon > Set future photo (or put a future.png or future.jpg in this folder)."],
+    "fine_amount": ["# Fine jar: every time you skip (Esc), this amount goes into your fine jar.",
+                    "# Tray icon > Fine jar shows what you owe. 0 = fine jar off."],
+    "fine_currency": ["# The currency shown next to the fine (just a label, e.g. CLP, USD, EUR)"],
+    "pay_link": ["# Optional: a payment link of your own (Mercado Pago, PayPal, a donation page...).",
+                 "# The Fine jar window then shows a 'Pay now' button that opens it in your browser.",
+                 "# Five never asks for or stores your card. This only opens the link in your browser",
+                 "# so you pay on that company's secure page. Leave it empty for no button.",
+                 "# Example: pay_link=https://www.paypal.me/yourname"],
 }
 
 WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -88,6 +100,7 @@ DEFAULT_ACTIONS = [
 FUTURE_PHOTO_NAMES = ["future.png", "future.jpg", "future.jpeg"]
 
 LOG_HEADER = ["date", "time", "result", "action"]
+FINES_HEADER = ["date", "time", "kind", "amount", "note"]
 
 # Colors and fonts for the full-screen window
 BG = "#0d0d0d"
@@ -312,6 +325,104 @@ def read_log():
 
 
 # --------------------------------------------------------------------------
+# Fine jar: fines.csv (kind "fine" on each skip, "paid" when you pay)
+# --------------------------------------------------------------------------
+
+def parse_amount(text):
+    """'1000', '1,000', ' 2.5 ' -> a number. Anything invalid or negative -> 0."""
+    try:
+        value = float(str(text).replace(",", "").replace(" ", "").replace("_", ""))
+    except ValueError:
+        return 0
+    if value != value or value <= 0 or value == float("inf"):  # NaN, inf, not positive
+        return 0
+    return int(value) if value.is_integer() else value
+
+
+def config_fine(config):
+    return parse_amount(config.get("fine_amount", "0"))
+
+
+def format_money(amount, currency=""):
+    """1000 -> '1,000', 2.5 -> '2.50'. Adds the currency label if given."""
+    amount = float(amount)
+    text = f"{int(amount):,}" if amount.is_integer() else f"{amount:,.2f}"
+    return f"{text} {currency}".strip()
+
+
+def append_fine(kind, amount, note="", when=None):
+    """Add one line to fines.csv. The amount is saved as it is now, so
+    changing fine_amount later never changes old fines."""
+    when = when or dt.datetime.now()
+    is_new = not FINES_FILE.exists() or FINES_FILE.stat().st_size == 0
+    with open(FINES_FILE, "a", encoding="utf-8", newline="") as f:
+        if is_new:
+            f.write("﻿")  # same BOM as log.csv, for Excel
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(FINES_HEADER)
+        writer.writerow([when.strftime("%Y-%m-%d"), when.strftime("%H:%M:%S"), kind,
+                         format_money(amount).replace(",", ""), note])
+
+
+def read_fines():
+    """List of (date, kind, amount) from fines.csv. Bad lines are skipped."""
+    rows = []
+    if not FINES_FILE.exists():
+        return rows
+    with open(FINES_FILE, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                day = dt.date.fromisoformat(row["date"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            kind = (row.get("kind") or "").strip().lower()
+            if kind in ("fine", "paid"):
+                rows.append((day, kind, parse_amount(row.get("amount"))))
+    return rows
+
+
+def fine_summary(rows, today=None):
+    """Owed = all fines - all payments, never below 0. Also counts the fines
+    (= skips) this week (since Monday) and this month."""
+    today = today or dt.date.today()
+    week_start = today - dt.timedelta(days=today.weekday())
+    fined = sum(a for _, k, a in rows if k == "fine")
+    paid = sum(a for _, k, a in rows if k == "paid")
+    owed = max(0, fined - paid)
+    if isinstance(owed, float):
+        owed = round(owed, 2)
+        if owed.is_integer():
+            owed = int(owed)
+    return {
+        "owed": owed,
+        "skips_week": sum(1 for d, k, _ in rows if k == "fine" and week_start <= d <= today),
+        "skips_month": sum(1 for d, k, _ in rows if k == "fine" and d <= today
+                           and (d.year, d.month) == (today.year, today.month)),
+    }
+
+
+def safe_pay_link(link):
+    """Only plain web links are opened. 'mpago.la/abc' becomes 'https://mpago.la/abc'."""
+    link = (link or "").strip()
+    if not link:
+        return ""
+    if "://" not in link:
+        link = "https://" + link
+    return link if link.lower().startswith(("https://", "http://")) else ""
+
+
+def open_pay_link(link):
+    """Open your own payment link in the default browser. Five itself never
+    sees or stores any card or payment details."""
+    import webbrowser
+    link = safe_pay_link(link)
+    if not link:
+        return False
+    return webbrowser.open(link)
+
+
+# --------------------------------------------------------------------------
 # Stats (--stats)
 # --------------------------------------------------------------------------
 
@@ -351,6 +462,13 @@ def print_stats(pause=False):
     print()
     print(f"  Current streak : {s['streak']} day(s) in a row with a 'Done'")
     print(f"  All-time uses  : {s['total']}")
+    try:
+        f = fine_summary(read_fines())
+        currency = load_config().get("fine_currency", "")
+        print(f"  Fine jar: {format_money(f['owed'], currency)} owed "
+              f"({f['skips_week']} skips this week)")
+    except Exception:
+        log_error("Fine jar stats failed:\n" + traceback.format_exc())
     print()
     if pause:
         input("  Press Enter to close this window...")
@@ -645,6 +763,7 @@ def start_tray(events):
         pystray.MenuItem("Open stats", lambda: events.put("stats")),
         pystray.MenuItem("Edit actions", lambda: events.put("edit")),
         pystray.MenuItem("Set future photo", lambda: events.put("future_photo")),
+        pystray.MenuItem("Fine jar", lambda: events.put("finejar")),
         pystray.MenuItem("Update Five", lambda: events.put("update")),
         pystray.MenuItem("Quit", lambda: events.put("quit")),
     )
@@ -727,6 +846,8 @@ class FiveApp:
         self.hotkey = None
         self.fired_schedules = set()
         self.pending_task = None
+        self.finejar_window = None
+        self.toast = None
 
     # Called from the keyboard thread: never touch tkinter here
     def request_show(self):
@@ -781,6 +902,8 @@ class FiveApp:
                     open_file(ACTIONS_FILE)
                 elif event == "future_photo":
                     self.set_future_photo()
+                elif event == "finejar":
+                    self.show_fine_jar()
                 elif event == "quit":
                     self.quit()
                     return
@@ -1095,6 +1218,151 @@ class FiveApp:
         append_log(result, self.action or "(closed during countdown)")
         self.window.destroy()
         self.window = None
+        if result == "skipped":
+            self.add_fine(self.action or self.typed_task or "(closed during countdown)")
+
+    # ---------------------------------------------------------------- fine jar
+
+    def add_fine(self, note):
+        """A skip puts fine_amount into the jar and shows a short toast."""
+        try:
+            config = load_config()
+            amount = config_fine(config)
+            if not amount:
+                return
+            append_fine("fine", amount, note)
+            currency = config.get("fine_currency", "")
+            owed = fine_summary(read_fines())["owed"]
+            self.show_toast(f"-{format_money(amount, currency)} to the fine jar  "
+                            f"(total owed: {format_money(owed, currency)})")
+            if self.finejar_window is not None:
+                self.draw_fine_jar()
+        except Exception:
+            log_error("Fine jar failed:\n" + traceback.format_exc())
+
+    def show_toast(self, text, ms=3000):
+        """Small dark box in the bottom-right corner. It never takes the focus."""
+        tk = self.tk
+        if self.toast is not None:
+            try:
+                self.toast.destroy()
+            except Exception:
+                pass
+        t = tk.Toplevel(self.root, bg=ACCENT)
+        self.toast = t
+        t.withdraw()
+        t.overrideredirect(True)  # no title bar or border
+        t.attributes("-topmost", True)
+        tk.Label(t, text=text, font=(FONT, 13, "bold"), fg=ACCENT, bg="#1a1a1a",
+                 padx=18, pady=12).pack(padx=2, pady=2)
+        t.update_idletasks()
+        x = t.winfo_screenwidth() - t.winfo_reqwidth() - 24
+        y = t.winfo_screenheight() - t.winfo_reqheight() - 64  # above the taskbar
+        t.geometry(f"+{x}+{y}")
+        if IS_WINDOWS:
+            try:  # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW: no focus, no taskbar button
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(t.winfo_id()) or t.winfo_id()
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+                ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x08000000 | 0x00000080)
+            except Exception:
+                pass
+        t.deiconify()
+
+        def close():
+            try:
+                t.destroy()
+            except Exception:
+                pass
+            if self.toast is t:
+                self.toast = None
+        t.after(ms, close)
+
+    def show_fine_jar(self):
+        """Tray > Fine jar: what you owe, Pay now, I paid it."""
+        if self.finejar_window is not None:
+            self.finejar_window.deiconify()
+            self.finejar_window.lift()
+            self.finejar_window.focus_force()
+            return
+        tk = self.tk
+        w = tk.Toplevel(self.root, bg=BG)
+        self.finejar_window = w
+        w.title("Five - Fine jar")
+        width, height = 520, 360
+        x = (w.winfo_screenwidth() - width) // 2
+        y = (w.winfo_screenheight() - height) // 2
+        w.geometry(f"{width}x{height}+{x}+{y}")
+        w.resizable(False, False)
+        w.attributes("-topmost", True)
+        w.protocol("WM_DELETE_WINDOW", self.close_fine_jar)
+        w.bind("<Escape>", lambda e: self.close_fine_jar())
+        self.draw_fine_jar()
+        w.focus_force()
+
+    def close_fine_jar(self):
+        if self.finejar_window is not None:
+            self.finejar_window.destroy()
+            self.finejar_window = None
+
+    def draw_fine_jar(self):
+        tk = self.tk
+        w = self.finejar_window
+        if w is None:
+            return
+        for widget in w.winfo_children():
+            widget.destroy()
+        config = load_config()
+        currency = config.get("fine_currency", "")
+        fine = config_fine(config)
+        link = safe_pay_link(config.get("pay_link", ""))
+        s = fine_summary(read_fines())
+
+        tk.Label(w, text="FINE JAR", font=(FONT, 13, "bold"), fg="#888888", bg=BG).pack(pady=(22, 0))
+        tk.Label(w, text=format_money(s["owed"], currency), font=(FONT, 40, "bold"),
+                 fg=ACCENT, bg=BG).pack()
+        tk.Label(w, text="owed", font=(FONT, 13), fg="#888888", bg=BG).pack()
+        skips = s["skips_month"]
+        tk.Label(w, text=f"{skips} skip{'' if skips == 1 else 's'} this month", font=(FONT, 15),
+                 fg=FG, bg=BG).pack(pady=(14, 0))
+        rule = (f"Each skip adds {format_money(fine, currency)}" if fine
+                else "Fine jar is off (fine_amount=0 in config.txt)")
+        tk.Label(w, text=rule, font=(FONT, 11), fg="#666666", bg=BG).pack(pady=(2, 0))
+
+        buttons = tk.Frame(w, bg=BG)
+        buttons.pack(pady=(18, 0))
+        pay = self._button(buttons, "Pay now", lambda: self.pay_now(link), primary=True)
+        if not link:
+            pay.config(state="disabled", bg="#3a3a3a", disabledforeground="#777777", cursor="arrow")
+        pay.pack(side="left", padx=6)
+        self._button(buttons, "I paid it", self.mark_paid).pack(side="left", padx=6)
+        self._button(buttons, "Close", self.close_fine_jar).pack(side="left", padx=6)
+        if not link:
+            tk.Label(w, text="Set pay_link in config.txt to get a Pay now button",
+                     font=(FONT, 11), fg="#666666", bg=BG).pack(pady=(12, 0))
+
+    def pay_now(self, link):
+        try:
+            open_pay_link(link)
+        except Exception:
+            log_error("Pay now failed:\n" + traceback.format_exc())
+
+    def mark_paid(self):
+        from tkinter import messagebox
+        w = self.finejar_window
+        try:
+            currency = load_config().get("fine_currency", "")
+            owed = fine_summary(read_fines())["owed"]
+            if not owed:
+                messagebox.showinfo("Five", "Nothing to pay. Your fine jar is empty.", parent=w)
+                return
+            if not messagebox.askyesno("Five", f"Did you pay {format_money(owed, currency)}?\n\n"
+                                       "This empties your fine jar.", parent=w):
+                return
+            append_fine("paid", owed, "marked as paid")
+        except Exception:
+            log_error("I paid it failed:\n" + traceback.format_exc())
+        self.draw_fine_jar()
 
 
 # --------------------------------------------------------------------------
