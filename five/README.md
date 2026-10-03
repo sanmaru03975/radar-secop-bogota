@@ -26,7 +26,8 @@ A partir de ahí, **Five se abre solo cada vez que prendes Windows**.
 
 | Qué haces | Qué pasa |
 |---|---|
-| **Ctrl + Alt + 5** (en cualquier programa) | Empieza la cuenta regresiva en pantalla completa |
+| **Ctrl + Alt + 5** (en cualquier programa) | Te pregunta *"What do you need to do?"*. Escribe tu tarea y presiona **Enter** (si lo dejas vacío, Five elige una acción al azar de `actions.txt`). Luego empieza la cuenta regresiva |
+| **Esc** en la pregunta | Cancela sin anotar nada |
 | Clic en **Done** o **Enter** | Se cierra y queda anotado como `done` en `log.csv` |
 | **Esc** | Se cierra y queda anotado como `skipped` en `log.csv` |
 | Clic derecho en el ícono **5** → **Open stats** | Te muestra tus estadísticas |
@@ -42,6 +43,8 @@ A partir de ahí, **Five se abre solo cada vez que prendes Windows**.
   - `close_browser=false`: cámbialo a `true` para que al llegar a GO se cierren todas las
     ventanas de Chrome y Edge.
   - `autostart=true`: cámbialo a `false` si no quieres que Five arranque con Windows.
+  - `ask_task=true`: Five te pregunta tu tarea antes de la cuenta regresiva. Con `false` siempre elige
+    una acción al azar de `actions.txt`.
 
   Los cambios de `hotkey` y `autostart` necesitan reiniciar Five (clic derecho en el
   ícono → **Quit** y después doble clic en `run.bat`). Los demás funcionan desde la siguiente cuenta regresiva.

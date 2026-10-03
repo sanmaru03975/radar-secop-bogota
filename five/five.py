@@ -1,8 +1,9 @@
 """
 Five - an interrupt tool based on Mel Robbins' 5-second rule.
 
-Press Ctrl+Alt+5 anywhere. A full-screen window counts 5, 4, 3, 2, 1, GO
-and then shows one random action from actions.txt.
+Press Ctrl+Alt+5 anywhere. Type the task you are avoiding (or leave it empty
+for a random one). A full-screen window counts 5, 4, 3, 2, 1, GO
+and then shows your task.
 
     Done / Enter  -> closes the window and logs "done" in log.csv
     Escape        -> closes the window and logs "skipped" in log.csv
@@ -36,6 +37,7 @@ DEFAULT_CONFIG = {
     "countdown_seconds": "5",
     "close_browser": "false",
     "autostart": "true",
+    "ask_task": "true",
 }
 
 DEFAULT_ACTIONS = [
@@ -82,6 +84,11 @@ def ensure_files():
             "",
             "# true = start Five automatically when Windows starts",
             f"autostart={DEFAULT_CONFIG['autostart']}",
+            "",
+            "# true = ask you to type your task before the countdown",
+            "# (leave it empty and press Enter to get a random action from actions.txt)",
+            "# false = always pick a random action from actions.txt",
+            f"ask_task={DEFAULT_CONFIG['ask_task']}",
         ]
         CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     if not ACTIONS_FILE.exists():
@@ -454,6 +461,7 @@ class FiveApp:
         tk = self.tk
         self.config = load_config()  # pick up edits without restarting
         self.action = None
+        self.typed_task = ""
         self.closed = False
 
         w = tk.Toplevel(self.root, bg=BG)
@@ -479,6 +487,41 @@ class FiveApp:
         w.protocol("WM_DELETE_WINDOW", lambda: self.finish("skipped"))
 
         self._grab_focus()
+        if config_bool(self.config, "ask_task"):
+            self.ask_task()
+        else:
+            self.start_countdown()
+
+    def ask_task(self):
+        """First screen: you type the task you are avoiding."""
+        tk = self.tk
+        self.asking = True
+        self.question = tk.Label(self.window, text="What do you need to do?",
+                                 font=(FONT, 40, "bold"), fg=FG, bg=BG)
+        self.question.place(relx=0.5, rely=0.35, anchor="center")
+        self.entry = tk.Entry(self.window, font=(FONT, 32), width=36, justify="center",
+                              fg=FG, bg="#1f1f1f", insertbackground=FG, relief="flat")
+        self.entry.place(relx=0.5, rely=0.5, anchor="center", height=70)
+        self.ask_hint = tk.Label(self.window,
+                                 text="Type it and press Enter     (empty = random action)     Esc = cancel",
+                                 font=(FONT, 14), fg="#666666", bg=BG)
+        self.ask_hint.place(relx=0.5, rely=0.62, anchor="center")
+        self.entry.bind("<Return>", self.task_entered)
+        self.entry.bind("<KP_Enter>", self.task_entered)
+        self.entry.focus_force()
+        self.window.after(200, lambda: self.window is not None and self.asking and self.entry.focus_force())
+
+    def task_entered(self, event=None):
+        self.typed_task = self.entry.get().strip()
+        self.asking = False
+        for widget in (self.question, self.entry, self.ask_hint):
+            widget.destroy()
+        self.window.focus_force()
+        self.start_countdown()
+        return "break"  # don't let this Enter also press "Done"
+
+    def start_countdown(self):
+        self.asking = False
         self.tick(config_seconds(self.config))
 
     def _grab_focus(self):
@@ -508,7 +551,7 @@ class FiveApp:
         if config_bool(self.config, "close_browser"):
             close_browsers()
             self._grab_focus()
-        self.action = random.choice(load_actions())
+        self.action = self.typed_task or random.choice(load_actions())
         self.action_label.config(text=self.action)
         self.action_label.place(relx=0.5, rely=0.55, anchor="center")
         self.done_button.place(relx=0.5, rely=0.78, anchor="center")
@@ -524,6 +567,10 @@ class FiveApp:
         if self.window is None or self.closed:
             return
         self.closed = True
+        if getattr(self, "asking", False):  # cancelled before starting: nothing to log
+            self.window.destroy()
+            self.window = None
+            return
         # Escape during the countdown still logs which action was skipped: none yet
         append_log(result, self.action or "(closed during countdown)")
         self.window.destroy()

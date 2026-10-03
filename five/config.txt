@@ -13,3 +13,8 @@ close_browser=false
 
 # true = start Five automatically when Windows starts
 autostart=true
+
+# true = ask you to type your task before the countdown
+# (leave it empty and press Enter to get a random action from actions.txt)
+# false = always pick a random action from actions.txt
+ask_task=true
