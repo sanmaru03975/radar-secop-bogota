@@ -46,6 +46,9 @@ DEFAULT_CONFIG = {
     "autostart": "true",
     "ask_task": "true",
     "schedule": "weekdays 21:00 Rutina de la noche",
+    "radar_sites": "youtube,instagram,tiktok,netflix,facebook,twitter,reddit",
+    "radar_minutes": "10",
+    "momentum_minutes": "10",
 }
 
 # The explanation written above each setting in config.txt
@@ -62,10 +65,25 @@ SETTING_HELP = {
                  "# TIME: 24-hour clock, 21:00 = 9 pm. You can add more schedule= lines.",
                  "# If the computer was off or asleep, it still runs up to 30 minutes late.",
                  "# schedule=off turns it off."],
+    "radar_sites": ["# Procrastination radar: words that mark a distracting window.",
+                    "# If the title of the window you are using contains one of these words,",
+                    "# Five counts it as distraction time. Separate the words with commas."],
+    "radar_minutes": ["# Procrastination radar: after this many minutes on distracting windows,",
+                      "# Five opens the countdown for you. 0 = radar off.",
+                      "# The count starts over if you stay away from them for 2 minutes."],
+    "momentum_minutes": ["# Momentum timer: after you press Done, a small box in the corner counts",
+                         "# down this many minutes to help you keep going. 0 = off."],
 }
 
 WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 SCHEDULE_GRACE_MINUTES = 30
+
+# Procrastination radar: how often the active window is checked, and how long
+# you must stay away from distracting windows for the count to start over
+RADAR_CHECK_MS = 5000
+RADAR_RESET_SECONDS = 120
+# A longer gap between two checks (sleep, a frozen app) never counts as more than this
+RADAR_MAX_STEP_SECONDS = 30
 
 DEFAULT_ACTIONS = [
     "Close the laptop and walk the dog",
@@ -365,6 +383,94 @@ def open_file(path):
 
 
 # --------------------------------------------------------------------------
+# Procrastination radar: notices long stretches on distracting windows
+# --------------------------------------------------------------------------
+
+def foreground_window_title():
+    """Title of the window you are using right now ('' if unknown)."""
+    if IS_WINDOWS:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        return buffer.value
+    import shutil
+    if not shutil.which("xdotool"):
+        return ""
+    # getactivewindow needs a window manager; getwindowfocus works without one
+    for how in ("getactivewindow", "getwindowfocus"):
+        try:
+            out = subprocess.run(["xdotool", how, "getwindowname"], capture_output=True,
+                                 text=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if out.returncode == 0:
+            return out.stdout.strip()
+    return ""
+
+
+def parse_radar_sites(text):
+    return [w.strip().lower() for w in (text or "").split(",") if w.strip()]
+
+
+def config_minutes(config, key):
+    """A number of minutes from config.txt; 0 (= off) if missing or invalid."""
+    try:
+        return max(0.0, float(config.get(key, "0").replace(",", ".")))
+    except ValueError:
+        return 0.0
+
+
+def format_minutes(minutes):
+    text = f"{minutes:g}"
+    return f"{text} minute" if text == "1" else f"{text} minutes"
+
+
+class DistractionRadar:
+    """Adds up time spent on distracting windows. Pure logic (no tkinter, no
+    clock of its own), so it can be tested with made-up timestamps."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.seconds = 0.0
+        self.last_check = None
+        self.last_distracted = None
+
+    def update(self, now, title, sites, limit_seconds, paused=False):
+        """Call every few seconds with now = time in seconds. Returns the
+        matched word when the limit is reached (and starts over), else None."""
+        last, self.last_check = self.last_check, now
+        if limit_seconds <= 0:
+            self.reset()
+            return None
+        if paused:  # Five's own window is open: don't count anything
+            return None
+        title = (title or "").lower()
+        word = next((w for w in sites if w and w in title), None)
+        if word is None:
+            if self.last_distracted is not None and now - self.last_distracted >= RADAR_RESET_SECONDS:
+                self.seconds = 0.0
+                self.last_distracted = None
+            return None
+        if last is not None:
+            self.seconds += max(0.0, min(now - last, RADAR_MAX_STEP_SECONDS))
+        self.last_distracted = now
+        if self.seconds >= limit_seconds:
+            self.reset()
+            self.last_check = now
+            return word
+        return None
+
+
+# --------------------------------------------------------------------------
 # Updating from a Five.zip in the Downloads folder (no internet needed)
 # --------------------------------------------------------------------------
 
@@ -624,6 +730,8 @@ class FiveApp:
         self.hotkey = None
         self.fired_schedules = set()
         self.pending_task = None
+        self.radar = DistractionRadar()
+        self.momentum = None  # the small "Keep going" box, if it is open
 
     # Called from the keyboard thread: never touch tkinter here
     def request_show(self):
@@ -644,7 +752,25 @@ class FiveApp:
             self.events.put("show")
         self.root.after(50, self._poll)
         self.root.after(2000, self._check_schedules)
+        self.root.after(RADAR_CHECK_MS, self._check_radar)
         self.root.mainloop()
+
+    def _check_radar(self):
+        if self.root is None:
+            return
+        try:
+            import time
+            config = load_config()
+            minutes = config_minutes(config, "radar_minutes")
+            open_now = self.window is not None
+            title = foreground_window_title() if minutes > 0 and not open_now else ""
+            word = self.radar.update(time.monotonic(), title, parse_radar_sites(config.get("radar_sites")),
+                                     minutes * 60, paused=open_now)
+            if word and self.window is None:
+                self.show(reason=f"You've been on {word.capitalize()} for {format_minutes(minutes)}.")
+        except Exception:
+            log_error("Procrastination radar failed:\n" + traceback.format_exc())
+        self.root.after(RADAR_CHECK_MS, self._check_radar)
 
     def _check_schedules(self):
         if self.root is None:
@@ -704,9 +830,10 @@ class FiveApp:
         self.root.destroy()
         self.root = None
 
-    def show(self, task=None):
+    def show(self, task=None, reason=None):
         """task=None: normal hotkey flow. task='...': scheduled, starts the
-        countdown right away with that task ('' = random from your list)."""
+        countdown right away with that task ('' = random from your list).
+        reason='...': a short line shown at the top (e.g. from the radar)."""
         if self.window is not None:  # already on screen
             return
         tk = self.tk
@@ -736,6 +863,8 @@ class FiveApp:
         w.bind("<Return>", lambda e: self.finish_done())
         w.bind("<KP_Enter>", lambda e: self.finish_done())
         w.protocol("WM_DELETE_WINDOW", lambda: self.finish("skipped"))
+        if reason:
+            tk.Label(w, text=reason, font=(FONT, 18), fg=ACCENT, bg=BG).place(relx=0.5, rely=0.04, anchor="n")
 
         self._grab_focus()
         if task is not None:
@@ -894,6 +1023,75 @@ class FiveApp:
         append_log(result, self.action or "(closed during countdown)")
         self.window.destroy()
         self.window = None
+        if result == "done":
+            self.start_momentum()
+
+    # ----- Momentum timer: a small "Keep going" box after Done -----
+
+    def start_momentum(self):
+        try:
+            import time
+            minutes = config_minutes(load_config(), "momentum_minutes")
+            self.close_momentum()  # only one at a time
+            if minutes <= 0:
+                return
+            tk = self.tk
+            m = tk.Toplevel(self.root, bg=BG, highlightthickness=1, highlightbackground=ACCENT)
+            self.momentum = m
+            m.overrideredirect(True)  # no title bar
+            m.attributes("-topmost", True)
+            width, height = 260, 90
+            x = m.winfo_screenwidth() - width - 16
+            y = m.winfo_screenheight() - height - 56  # stay above the taskbar
+            m.geometry(f"{width}x{height}+{x}+{y}")
+            m.momentum_label = tk.Label(m, text="", font=(FONT, 15, "bold"), fg=FG, bg=BG)
+            m.momentum_label.place(relx=0.5, rely=0.55, anchor="center")
+            tk.Button(m, text="✕", command=self.close_momentum, relief="flat", cursor="hand2",
+                      font=(FONT, 10), fg="#888888", bg=BG, activebackground="#262626",
+                      activeforeground=FG, bd=0, padx=6, pady=0).place(relx=1.0, x=-4, y=4, anchor="ne")
+            m.momentum_end = time.monotonic() + minutes * 60
+            if IS_WINDOWS:
+                self._momentum_no_activate(m)
+            self._momentum_tick(m)
+        except Exception:
+            log_error("Momentum timer failed:\n" + traceback.format_exc())
+
+    def _momentum_no_activate(self, m):
+        """Windows: clicking the box must not take the focus from your other apps."""
+        try:
+            import ctypes
+            m.update_idletasks()
+            hwnd = int(m.wm_frame(), 16)
+            GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW = -20, 0x08000000, 0x00000080
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                                style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+        except Exception:
+            log_error("Momentum no-activate failed:\n" + traceback.format_exc())
+
+    def _momentum_tick(self, m):
+        if self.momentum is not m:  # closed or replaced by a newer one
+            return
+        try:
+            import time
+            left = int(round(m.momentum_end - time.monotonic()))
+            if left > 0:
+                m.momentum_label.config(text=f"Keep going: {left // 60}:{left % 60:02d}")
+                m.after(1000, self._momentum_tick, m)
+            else:
+                m.momentum_label.config(text="★ You kept going!", fg=ACCENT)
+                m.after(4000, lambda: self.momentum is m and self.close_momentum())
+        except Exception:
+            log_error("Momentum timer failed:\n" + traceback.format_exc())
+            self.close_momentum()
+
+    def close_momentum(self):
+        m, self.momentum = self.momentum, None
+        if m is not None:
+            try:
+                m.destroy()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------
