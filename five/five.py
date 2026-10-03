@@ -34,7 +34,7 @@ FINES_FILE = APP_DIR / "fines.csv"  # the fine jar: what you owe for skipping
 IS_WINDOWS = sys.platform == "win32"
 
 # Bump this every time a new Five.zip is sent, so "Update Five" knows it is newer
-VERSION = "1.5"
+VERSION = "1.5.1"
 
 # Files that "Update Five" may replace. Your actions.txt, config.txt and
 # log.csv are never touched.
@@ -739,7 +739,8 @@ def open_stats_window():
 VOICE_FILE = APP_DIR / "voice.wav"
 VOICE_EXTRA_SECONDS = 1.5  # recording lasts countdown_seconds + this (room for "GO!")
 MIC_ERROR_TEXT = ("Couldn't use the microphone. Check that one is connected and that "
-                  "Windows allows apps to use it: Settings > Privacy > Microphone.")
+                  "Windows allows apps to use it: Settings > Privacy & security > Microphone "
+                  "(turn on 'Let desktop apps access your microphone').")
 
 _voice_proc = None  # Linux only: the aplay/paplay process that is playing
 
@@ -791,58 +792,127 @@ def stop_voice():
         log_error("Stopping voice.wav failed:\n" + traceback.format_exc())
 
 
-class MciError(Exception):
-    pass
+class MicError(Exception):
+    """A microphone problem, with a message written for a person."""
 
 
-def mci_send(command):
-    """Send one command to the Windows MCI audio API. Raises MciError on failure."""
-    import ctypes
-    winmm = ctypes.windll.winmm
-    code = winmm.mciSendStringW(command, None, 0, None)
-    if code != 0:
-        buf = ctypes.create_unicode_buffer(256)
-        try:
-            winmm.mciGetErrorStringW(code, buf, 256)
-            text = buf.value
-        except Exception:
-            text = ""
-        raise MciError(f"{command!r} failed ({code}): {text or 'unknown error'}")
+MIC_PRIVACY_HELP = ("Windows may be blocking the microphone. Open Settings > Privacy & security > "
+                    "Microphone and turn ON both 'Microphone access' and "
+                    "'Let desktop apps access your microphone'. Then try again.")
 
 
-def short_path(path):
-    """The old-style 8.3 path (no spaces) of an existing folder or file, or None."""
-    try:
+class WaveInRecorder:
+    """Records from the default microphone with the Windows waveIn API
+    (part of Windows, no extra install). 16-bit mono 44.1 kHz."""
+
+    RATE, CHANNELS, BITS = 44100, 1, 16
+
+    def __init__(self, seconds):
         import ctypes
-        buf = ctypes.create_unicode_buffer(1024)
-        n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 1024)
-        return buf.value if 0 < n < 1024 else None
-    except Exception:
-        return None
+        from ctypes import wintypes
+        self.ctypes = ctypes
 
+        class WAVEFORMATEX(ctypes.Structure):
+            _fields_ = [("wFormatTag", wintypes.WORD), ("nChannels", wintypes.WORD),
+                        ("nSamplesPerSec", wintypes.DWORD), ("nAvgBytesPerSec", wintypes.DWORD),
+                        ("nBlockAlign", wintypes.WORD), ("wBitsPerSample", wintypes.WORD),
+                        ("cbSize", wintypes.WORD)]
 
-def mci_save_recording(alias, name):
-    """Save the MCI recording to a file called `name`, trying a few folders because
-    MCI dislikes some paths. Returns the Path of the saved file. Raises MciError."""
-    import tempfile
-    candidates = []
-    for folder in (APP_DIR, Path(tempfile.gettempdir())):
-        candidates.append(folder / name)
-        short = short_path(folder)
-        if short:
-            candidates.append(Path(short) / name)
-    errors = []
-    for target in dict.fromkeys(candidates):
+        class WAVEHDR(ctypes.Structure):
+            _fields_ = [("lpData", ctypes.c_void_p), ("dwBufferLength", wintypes.DWORD),
+                        ("dwBytesRecorded", wintypes.DWORD), ("dwUser", ctypes.c_size_t),
+                        ("dwFlags", wintypes.DWORD), ("dwLoops", wintypes.DWORD),
+                        ("lpNext", ctypes.c_void_p), ("reserved", ctypes.c_size_t)]
+
+        block = self.CHANNELS * self.BITS // 8
+        self.format = WAVEFORMATEX(1, self.CHANNELS, self.RATE, self.RATE * block, block, self.BITS, 0)
+        size = int(self.RATE * block * seconds)
+        size -= size % block
+        self.buffer = ctypes.create_string_buffer(size)
+        self.header = WAVEHDR()
+        self.header.lpData = ctypes.cast(self.buffer, ctypes.c_void_p)
+        self.header.dwBufferLength = size
+        self.handle = ctypes.c_void_p()
+        self.winmm = ctypes.windll.winmm
+        w = self.winmm
+        w.waveInOpen.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint,
+                                 ctypes.POINTER(WAVEFORMATEX), ctypes.c_size_t, ctypes.c_size_t,
+                                 wintypes.DWORD]
+        for name in ("waveInPrepareHeader", "waveInUnprepareHeader", "waveInAddBuffer"):
+            getattr(w, name).argtypes = [ctypes.c_void_p, ctypes.POINTER(WAVEHDR), ctypes.c_uint]
+        for name in ("waveInStart", "waveInReset", "waveInClose"):
+            getattr(w, name).argtypes = [ctypes.c_void_p]
+        self.is_open = self.prepared = False
+
+    def _check(self, code, step):
+        if code == 0:
+            return
+        text = self.ctypes.create_unicode_buffer(256)
         try:
-            if target.exists():
-                target.unlink()
-            mci_send(f'save {alias} "{target}"')
-            if target.is_file() and target.stat().st_size > 44:  # more than a WAV header
-                return target
-            errors.append(f"{target}: file missing or empty")
-        except (MciError, OSError) as exc:
-            errors.append(str(exc))
-    raise MciError("Could not save the recording:\n" + "\n".join(errors))
+            self.winmm.waveInGetErrorTextW(code, text, 256)
+        except Exception:
+            pass
+        detail = f"{step} failed ({code}): {text.value or 'unknown error'}"
+        if code in (2, 6):  # BADDEVICEID / NODRIVER
+            raise MicError("No microphone was found. Connect one (or a headset with a mic) "
+                           "and try again.\n\n" + detail)
+        if code == 4:  # ALLOCATED
+            raise MicError("Another app is using the microphone (a call, Zoom, Teams...). "
+                           "Close it and try again.\n\n" + detail)
+        raise MicError(MIC_PRIVACY_HELP + "\n\n" + detail)
+
+    def open(self):
+        WAVE_MAPPER = 0xFFFFFFFF  # the default microphone
+        self._check(self.winmm.waveInOpen(self.ctypes.byref(self.handle), WAVE_MAPPER,
+                                          self.ctypes.byref(self.format), 0, 0, 0), "Opening the microphone")
+        self.is_open = True
+        size = self.ctypes.sizeof(self.header)
+        self._check(self.winmm.waveInPrepareHeader(self.handle, self.ctypes.byref(self.header), size),
+                    "Preparing the recording")
+        self.prepared = True
+        self._check(self.winmm.waveInAddBuffer(self.handle, self.ctypes.byref(self.header), size),
+                    "Preparing the recording")
+
+    def start(self):
+        self._check(self.winmm.waveInStart(self.handle), "Starting the recording")
+
+    def stop(self):
+        """Stop and return the recorded bytes."""
+        try:
+            self.winmm.waveInReset(self.handle)  # marks the buffer as done
+            return self.buffer.raw[:self.header.dwBytesRecorded]
+        finally:
+            self.close()
+
+    def close(self):
+        # Windows wants this order: stop (reset), release the buffer, close
+        if self.is_open:
+            self.winmm.waveInReset(self.handle)
+        if self.prepared:
+            self.prepared = False
+            self.winmm.waveInUnprepareHeader(self.handle, self.ctypes.byref(self.header),
+                                             self.ctypes.sizeof(self.header))
+        if self.is_open:
+            self.is_open = False
+            self.winmm.waveInClose(self.handle)
+
+
+def write_wav(path, data, rate=44100, channels=1, bits=16):
+    import wave
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(channels)
+        f.setsampwidth(bits // 8)
+        f.setframerate(rate)
+        f.writeframes(data)
+
+
+def is_silent(data):
+    """True if a 16-bit recording is (almost) pure silence: what Windows gives
+    when the microphone privacy setting blocks desktop apps."""
+    import array
+    samples = array.array("h")
+    samples.frombytes(data[: len(data) - len(data) % 2])
+    return not samples or max(abs(x) for x in samples) < 40
 
 
 def install_voice_file(new_file):
@@ -1733,7 +1803,6 @@ class VoiceRecorder:
     at the same pace as the real countdown, so your voice lines up with it."""
 
     WIDTH, HEIGHT = 600, 400
-    MCI_ALIAS = "fiverec"
     NEW_NAME = "five_voice_new.wav"
 
     def __init__(self, root):
@@ -1742,7 +1811,7 @@ class VoiceRecorder:
         self.root = root
         self.recording = False
         self.token = 0          # bumped on close, so pending timers do nothing
-        self.mci_open = False
+        self.wavein = None      # Windows: the WaveInRecorder
         self.proc = None        # Linux: the arecord process
         self.linux_file = None
 
@@ -1893,7 +1962,7 @@ class VoiceRecorder:
     def _fail(self, exc):
         """Something went wrong: tell the user, keep the old voice.wav."""
         log_error(f"Voice recording failed: {exc}\n" + traceback.format_exc())
-        if self.recording or self.mci_open or self.proc is not None:
+        if self.recording or self.wavein is not None or self.proc is not None:
             self._abort()
         self.recording = False
         if self.win is None:
@@ -1902,23 +1971,17 @@ class VoiceRecorder:
         self.big.config(text="", fg=FG)
         self._set_idle_status()
         from tkinter import messagebox
-        messagebox.showerror("Five", MIC_ERROR_TEXT, parent=self.win)
+        text = str(exc) if isinstance(exc, MicError) else MIC_ERROR_TEXT + f"\n\nDetails: {exc}"
+        messagebox.showerror("Five", text, parent=self.win)
 
-    # ---- Windows (MCI) and Linux (arecord, for testing) ----
+    # ---- Windows (waveIn) and Linux (arecord, for testing) ----
 
     def _prepare(self):
         """Open the microphone. Returns False if recording isn't possible here."""
         if IS_WINDOWS:
-            try:
-                mci_send(f"close {self.MCI_ALIAS}")  # leftover from a crash, if any
-            except MciError:
-                pass
-            mci_send(f"open new type waveaudio alias {self.MCI_ALIAS}")
-            self.mci_open = True
-            try:
-                mci_send(f"set {self.MCI_ALIAS} bitspersample 16 samplespersec 44100 channels 1")
-            except MciError as exc:  # the defaults are fine too
-                log_error(f"Voice recording: using default quality ({exc})")
+            # a little longer than needed; we stop it ourselves at the right moment
+            self.wavein = WaveInRecorder(self.seconds + VOICE_EXTRA_SECONDS + 2)
+            self.wavein.open()
             return True
         if _find_program("arecord") is None:
             from tkinter import messagebox
@@ -1928,7 +1991,7 @@ class VoiceRecorder:
 
     def _start(self):
         if IS_WINDOWS:
-            mci_send(f"record {self.MCI_ALIAS}")
+            self.wavein.start()
             return
         import math
         import tempfile
@@ -1941,11 +2004,15 @@ class VoiceRecorder:
     def _stop_and_save(self):
         """Stop recording and return the Path of the new (temporary) file."""
         if IS_WINDOWS:
-            try:
-                mci_send(f"stop {self.MCI_ALIAS}")
-                return mci_save_recording(self.MCI_ALIAS, self.NEW_NAME)
-            finally:
-                self._close_mci()
+            wavein, self.wavein = self.wavein, None
+            data = wavein.stop()
+            if is_silent(data):
+                raise MicError("The recording was completely silent. " + MIC_PRIVACY_HELP +
+                               "\n\nAlso check that the right microphone is the default one: "
+                               "Settings > System > Sound > Input.")
+            target = APP_DIR / self.NEW_NAME
+            write_wav(target, data)
+            return target
         proc, self.proc = self.proc, None
         err = b""
         try:
@@ -1958,23 +2025,15 @@ class VoiceRecorder:
             raise RuntimeError(f"arecord made no sound file: {err.decode(errors='replace')}")
         return self.linux_file
 
-    def _close_mci(self):
-        if self.mci_open:
-            self.mci_open = False
-            try:
-                mci_send(f"close {self.MCI_ALIAS}")
-            except MciError as exc:
-                log_error(f"Voice recording: {exc}")
-
     def _abort(self):
         """Stop recording without saving (window closed or an error)."""
         if IS_WINDOWS:
-            if self.mci_open:
+            wavein, self.wavein = self.wavein, None
+            if wavein is not None:
                 try:
-                    mci_send(f"stop {self.MCI_ALIAS}")
-                except Exception:
-                    pass
-            self._close_mci()
+                    wavein.close()
+                except Exception as exc:
+                    log_error(f"Voice recording: closing the microphone failed: {exc}")
         elif self.proc is not None:
             try:
                 self.proc.terminate()
