@@ -46,6 +46,8 @@ DEFAULT_CONFIG = {
     "autostart": "true",
     "ask_task": "true",
     "schedule": "weekdays 21:00 Rutina de la noche",
+    "default_tiny_step": "Just do the first 2 minutes. Nothing else.",
+    "future_message": "",
 }
 
 # The explanation written above each setting in config.txt
@@ -62,17 +64,28 @@ SETTING_HELP = {
                  "# TIME: 24-hour clock, 21:00 = 9 pm. You can add more schedule= lines.",
                  "# If the computer was off or asleep, it still runs up to 30 minutes late.",
                  "# schedule=off turns it off."],
+    "default_tiny_step": ["# The small line shown under your task at GO, when the task has no",
+                          "# first step of its own. In actions.txt you can give each action its",
+                          "# own first step after a | sign, like this:",
+                          "#   Go to the gym | Put on your shoes. That's it."],
+    "future_message": ["# A message from future you, shown under the numbers during the countdown.",
+                       "# Example: future_message=Santi, you promised. Do it for future you.",
+                       "# Leave it empty for no message. To also show a photo, use the tray",
+                       "# icon > Set future photo (or put a future.png or future.jpg in this folder)."],
 }
 
 WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 SCHEDULE_GRACE_MINUTES = 30
 
 DEFAULT_ACTIONS = [
-    "Close the laptop and walk the dog",
-    "Text Tito",
-    "Go to the gym",
-    "Open the BancoEstado folder",
+    "Close the laptop and walk the dog | Close the laptop lid. Just that.",
+    "Text Tito | Open the chat with Tito. Nothing else.",
+    "Go to the gym | Put on your shoes. That's it.",
+    "Open the BancoEstado folder | Just double-click the folder. Nothing else.",
 ]
+
+# The photo for "future you" is the first of these files found in APP_DIR
+FUTURE_PHOTO_NAMES = ["future.png", "future.jpg", "future.jpeg"]
 
 LOG_HEADER = ["date", "time", "result", "action"]
 
@@ -203,12 +216,45 @@ def config_seconds(config):
         return 5
 
 
-def read_actions():
+def split_action(line):
+    """'Go to the gym | Put on your shoes.' -> ('Go to the gym', 'Put on your shoes.')
+    A line without | gives (line, '')."""
+    action, _, step = line.partition("|")
+    return action.strip(), step.strip()
+
+
+def read_action_entries():
+    """[(action, tiny_step), ...] from actions.txt (tiny_step may be '')."""
     try:
         text = ACTIONS_FILE.read_text(encoding="utf-8-sig")
     except OSError:
         text = ""
-    return [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+    entries = []
+    for l in text.splitlines():
+        if not l.strip() or l.strip().startswith("#"):
+            continue
+        action, step = split_action(l)
+        if action:
+            entries.append((action, step))
+    return entries
+
+
+def read_actions():
+    """Just the action names (the part before | on each line)."""
+    return [action for action, _ in read_action_entries()]
+
+
+def tiny_step_for(action, config=None):
+    """The first tiny step for `action`: from actions.txt if that line has
+    '| step', otherwise the default_tiny_step setting."""
+    try:
+        for name, step in read_action_entries():
+            if step and name.lower() == action.strip().lower():
+                return step
+    except Exception:
+        log_error("tiny_step_for failed:\n" + traceback.format_exc())
+    config = config or load_config()
+    return config.get("default_tiny_step", "").strip()
 
 
 def load_actions():
@@ -216,8 +262,8 @@ def load_actions():
 
 
 def add_action(action):
-    action = action.strip()
-    if not action or action in read_actions():
+    action = action.strip()  # may be 'task | first step'
+    if not split_action(action)[0] or split_action(action)[0] in read_actions():
         return
     try:
         old = ACTIONS_FILE.read_text(encoding="utf-8-sig")
@@ -232,7 +278,7 @@ def remove_action(action):
     """Delete the first line that matches `action`; comments stay as they are."""
     lines = ACTIONS_FILE.read_text(encoding="utf-8-sig").splitlines()
     for i, line in enumerate(lines):
-        if line.strip() == action:
+        if not line.strip().startswith("#") and split_action(line)[0] == action.strip():
             del lines[i]
             break
     ACTIONS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -598,12 +644,69 @@ def start_tray(events):
     menu = pystray.Menu(
         pystray.MenuItem("Open stats", lambda: events.put("stats")),
         pystray.MenuItem("Edit actions", lambda: events.put("edit")),
+        pystray.MenuItem("Set future photo", lambda: events.put("future_photo")),
         pystray.MenuItem("Update Five", lambda: events.put("update")),
         pystray.MenuItem("Quit", lambda: events.put("quit")),
     )
     icon = pystray.Icon("Five", make_icon_image(), "Five - Ctrl+Alt+5", menu)
     icon.run_detached()
     return icon
+
+
+# --------------------------------------------------------------------------
+# "Future you": an optional photo shown during the countdown
+# --------------------------------------------------------------------------
+
+def find_future_photo():
+    for name in FUTURE_PHOTO_NAMES:
+        path = APP_DIR / name
+        if path.is_file():
+            return path
+    return None
+
+
+def load_future_photo(max_width, max_height):
+    """The future-you photo as a Tk image that fits in max_width x max_height,
+    or None if there is no photo (or it can't be read)."""
+    path = find_future_photo()
+    if path is None:
+        return None
+    try:
+        from PIL import Image, ImageOps, ImageTk
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)  # phone photos may be stored sideways
+            img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+            scale = min(max_width / img.width, max_height / img.height)
+            size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+            img = img.resize(size, Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+    except Exception:
+        log_error(f"Could not load the future photo {path.name}:\n" + traceback.format_exc())
+        return None
+
+
+def install_future_photo(source):
+    """Copy the chosen image to APP_DIR/future.<ext>, replacing any older one.
+    Returns the new file's path."""
+    import shutil
+    from PIL import Image
+    source = Path(source)
+    with Image.open(source) as img:  # make sure it really is an image
+        img.load()
+        ext = source.suffix.lower()
+        old = [APP_DIR / n for n in FUTURE_PHOTO_NAMES] + \
+              [APP_DIR / f"future{e}" for e in (".gif", ".bmp", ".webp")]
+        for path in old:
+            if path.exists() and path.resolve() != source.resolve():
+                path.unlink()
+        if ext in (".png", ".jpg", ".jpeg"):
+            target = APP_DIR / f"future{ext}"
+            if target.resolve() != source.resolve():
+                shutil.copyfile(source, target)
+        else:  # other formats are saved as PNG so they are found next time
+            target = APP_DIR / "future.png"
+            img.save(target, "PNG")
+    return target
 
 
 # --------------------------------------------------------------------------
@@ -676,6 +779,8 @@ class FiveApp:
                         return
                 elif event == "edit":
                     open_file(ACTIONS_FILE)
+                elif event == "future_photo":
+                    self.set_future_photo()
                 elif event == "quit":
                     self.quit()
                     return
@@ -695,6 +800,25 @@ class FiveApp:
         messagebox.showinfo("Five", message, parent=self.root)
         restart_five()  # the new copy waits until this one has closed
         self.quit()
+
+    def set_future_photo(self):
+        """Tray > Set future photo: pick an image, copy it as future.<ext>."""
+        from tkinter import filedialog, messagebox
+        self.root.attributes("-topmost", True)  # so the dialog isn't hidden
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Choose a photo of future you",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                       ("PNG", "*.png"), ("JPEG", "*.jpg *.jpeg")])
+        if not path:  # cancelled
+            return
+        try:
+            target = install_future_photo(path)
+        except Exception as exc:
+            log_error("Set future photo failed:\n" + traceback.format_exc())
+            messagebox.showerror("Five", f"That photo could not be used.\n\n{exc}", parent=self.root)
+            return
+        messagebox.showinfo("Five", f"Done! Your future-you photo is saved as {target.name}.\n\n"
+                                    "You will see it during the countdown.", parent=self.root)
 
     def quit(self):
         if self.hotkey:
@@ -731,6 +855,12 @@ class FiveApp:
                                      activebackground=FG, activeforeground=BG, relief="flat",
                                      padx=60, pady=14, cursor="hand2", command=self.finish_done)
         self.hint = tk.Label(w, text="Enter = Done     Esc = skip", font=(FONT, 14), fg="#666666", bg=BG)
+        self.step_label = tk.Label(w, text="", font=(FONT, 22), fg="#b3b3b3", bg=BG,
+                                   wraplength=int(w.winfo_screenwidth() * 0.7), justify="center")
+        self.future_image = None  # keep a reference, or Tk forgets the picture
+        self.future_photo_label = tk.Label(w, bg=BG, bd=0)
+        self.future_message_label = tk.Label(w, text="", font=(FONT, 26, "italic"), fg=ACCENT, bg=BG,
+                                             wraplength=int(w.winfo_screenwidth() * 0.8), justify="center")
 
         w.bind("<Escape>", lambda e: self.finish("skipped"))
         w.bind("<Return>", lambda e: self.finish_done())
@@ -841,7 +971,39 @@ class FiveApp:
 
     def start_countdown(self):
         self.asking = False
+        self.show_future_you()
         self.tick(config_seconds(self.config))
+
+    def show_future_you(self):
+        """Photo and/or message from future you under the countdown number."""
+        try:
+            w = self.window
+            sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+            message = self.config.get("future_message", "").strip()
+            self.future_image = load_future_photo(int(sw * 0.5), int(sh * 0.4))
+            if self.future_image is not None:
+                # Smaller number, higher up, so the photo and message fit below
+                self.big.config(font=(FONT, 150, "bold"))
+                self.big.place(relx=0.5, rely=0.2, anchor="center")
+                self.future_photo_label.config(image=self.future_image)
+                self.future_photo_label.place(relx=0.5, rely=0.6, anchor="center")
+                message_y = 0.87
+            else:
+                message_y = 0.75
+            if message:
+                self.future_message_label.config(text=message)
+                self.future_message_label.place(relx=0.5, rely=message_y, anchor="center")
+        except Exception:
+            log_error("show_future_you failed:\n" + traceback.format_exc())
+
+    def hide_future_you(self):
+        try:
+            self.future_photo_label.place_forget()
+            self.future_message_label.place_forget()
+            self.future_photo_label.config(image="")
+            self.future_image = None
+        except Exception:
+            log_error("hide_future_you failed:\n" + traceback.format_exc())
 
     def _grab_focus(self):
         w = self.window
@@ -864,6 +1026,7 @@ class FiveApp:
             self.go()
 
     def go(self):
+        self.hide_future_you()
         self.big.config(text="GO", fg=ACCENT, font=(FONT, 160, "bold"))
         self.big.place(relx=0.5, rely=0.25, anchor="center")
         self.window.update_idletasks()
@@ -871,11 +1034,49 @@ class FiveApp:
             close_browsers()
             self._grab_focus()
         self.action = self.typed_task or random.choice(load_actions())
+        # A typed 'task | first step' also works
+        self.action, typed_step = split_action(self.action)
+        self.action = self.action or "Add your actions to actions.txt"
+        step = typed_step or tiny_step_for(self.action, self.config)
         self.action_label.config(text=self.action)
-        self.action_label.place(relx=0.5, rely=0.55, anchor="center")
+        self.action_label.place(relx=0.5, rely=0.47, anchor="center")
+        if step:
+            self.step_label.config(text="First tiny step: " + step)
+            # right under the action, however many lines the action takes
+            self.step_label.place(in_=self.action_label, relx=0.5, rely=1.0, y=18, anchor="n")
         self.done_button.place(relx=0.5, rely=0.78, anchor="center")
         self.hint.place(relx=0.5, rely=0.92, anchor="center")
+        self._fit_go_layout(bool(step))
         self.done_button.focus_set()
+
+    def _fit_go_layout(self, has_step):
+        """A long task can take several lines: push things apart so the
+        task, tiny step, Done button and hint never overlap."""
+        try:
+            import tkinter.font as tkfont
+            w = self.window
+            w.update_idletasks()
+            sh = w.winfo_screenheight()
+            # bottom of the letters G O (the label box also has room for descenders)
+            big_font = tkfont.Font(font=self.big.cget("font"))
+            go_bottom = (self.big.winfo_y() + (self.big.winfo_height() - big_font.metrics("linespace")) // 2
+                         + big_font.metrics("ascent"))
+            a = self.action_label
+            if a.winfo_y() < go_bottom + 10:
+                a.place(relx=0.5, rely=0, y=go_bottom + 10, anchor="n")
+                w.update_idletasks()
+            text_bottom = a.winfo_y() + a.winfo_height()
+            if has_step:
+                s = self.step_label
+                text_bottom = s.winfo_y() + s.winfo_height()
+            done_h = self.done_button.winfo_reqheight()
+            done_y = max(int(sh * 0.78), text_bottom + 24 + done_h // 2)
+            hint_h = self.hint.winfo_reqheight()
+            hint_y = min(max(int(sh * 0.92), done_y + done_h // 2 + 12 + hint_h // 2), sh - hint_h // 2)
+            self.done_button.place(relx=0.5, rely=0, y=done_y, anchor="center")
+            self.hint.place(relx=0.5, rely=0, y=hint_y, anchor="center")
+        except Exception:
+            log_error("GO layout failed:\n" + traceback.format_exc())
 
     def finish_done(self):
         if self.action is None:  # Enter during the countdown does nothing
