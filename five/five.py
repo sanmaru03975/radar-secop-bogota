@@ -33,7 +33,7 @@ ERROR_FILE = APP_DIR / "five_error.log"
 IS_WINDOWS = sys.platform == "win32"
 
 # Bump this every time a new Five.zip is sent, so "Update Five" knows it is newer
-VERSION = "1.3"
+VERSION = "1.4"
 
 # Files that "Update Five" may replace. Your actions.txt, config.txt and
 # log.csv are never touched.
@@ -45,7 +45,27 @@ DEFAULT_CONFIG = {
     "close_browser": "false",
     "autostart": "true",
     "ask_task": "true",
+    "schedule": "weekdays 21:00 Rutina de la noche",
 }
+
+# The explanation written above each setting in config.txt
+SETTING_HELP = {
+    "hotkey": ["# Global hotkey. Examples: ctrl+alt+5, ctrl+shift+f, ctrl+alt+f9"],
+    "countdown_seconds": ["# How many seconds the countdown lasts (5 = 5, 4, 3, 2, 1, GO)"],
+    "close_browser": ["# true = close all Chrome and Edge windows at GO"],
+    "autostart": ["# true = start Five automatically when Windows starts"],
+    "ask_task": ["# true = ask you to type your task before the countdown",
+                 "# (leave it empty and press Enter to get a random action from actions.txt)",
+                 "# false = always pick a random action from actions.txt"],
+    "schedule": ["# Automatic countdowns, no hotkey needed: DAYS TIME TASK",
+                 "# DAYS: weekdays (Mon-Fri), weekends, daily, or a list like mon,wed,fri",
+                 "# TIME: 24-hour clock, 21:00 = 9 pm. You can add more schedule= lines.",
+                 "# If the computer was off or asleep, it still runs up to 30 minutes late.",
+                 "# schedule=off turns it off."],
+}
+
+WEEKDAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+SCHEDULE_GRACE_MINUTES = 30
 
 DEFAULT_ACTIONS = [
     "Close the laptop and walk the dog",
@@ -74,36 +94,34 @@ def log_error(message):
 
 
 def ensure_files():
-    """Create config.txt and actions.txt with examples if they are missing."""
+    """Create config.txt and actions.txt if missing, and add any new settings
+    to an existing config.txt (your values are never changed)."""
     if not CONFIG_FILE.exists():
-        lines = [
-            "# Five settings. Change the value after the = sign and restart Five.",
-            "# Lines that start with # are ignored.",
-            "",
-            "# Global hotkey. Examples: ctrl+alt+5, ctrl+shift+f, ctrl+alt+f9",
-            f"hotkey={DEFAULT_CONFIG['hotkey']}",
-            "",
-            "# How many seconds the countdown lasts (5 = 5, 4, 3, 2, 1, GO)",
-            f"countdown_seconds={DEFAULT_CONFIG['countdown_seconds']}",
-            "",
-            "# true = close all Chrome and Edge windows at GO",
-            f"close_browser={DEFAULT_CONFIG['close_browser']}",
-            "",
-            "# true = start Five automatically when Windows starts",
-            f"autostart={DEFAULT_CONFIG['autostart']}",
-            "",
-            "# true = ask you to type your task before the countdown",
-            "# (leave it empty and press Enter to get a random action from actions.txt)",
-            "# false = always pick a random action from actions.txt",
-            f"ask_task={DEFAULT_CONFIG['ask_task']}",
-        ]
+        lines = ["# Five settings. Change the value after the = sign and save.",
+                 "# hotkey and autostart need a restart of Five (tray > Quit, then run.bat).",
+                 "# Lines that start with # are ignored."]
+        for key, value in DEFAULT_CONFIG.items():
+            lines += [""] + SETTING_HELP[key] + [f"{key}={value}"]
         CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    else:
+        text = CONFIG_FILE.read_text(encoding="utf-8-sig")
+        present = {l.split("=", 1)[0].strip().lower() for l in text.splitlines()
+                   if "=" in l and not l.strip().startswith("#")}
+        missing = [k for k in DEFAULT_CONFIG if k not in present]
+        if missing:
+            add = []
+            for key in missing:
+                add += [""] + SETTING_HELP[key] + [f"{key}={DEFAULT_CONFIG[key]}"]
+            if not text.endswith("\n"):
+                text += "\n"
+            CONFIG_FILE.write_text(text + "\n".join(add) + "\n", encoding="utf-8")
     if not ACTIONS_FILE.exists():
         ACTIONS_FILE.write_text("\n".join(DEFAULT_ACTIONS) + "\n", encoding="utf-8")
 
 
 def load_config():
     config = dict(DEFAULT_CONFIG)
+    schedules = []
     try:
         # utf-8-sig also accepts files saved by Notepad with a BOM
         for line in CONFIG_FILE.read_text(encoding="utf-8-sig").splitlines():
@@ -111,10 +129,67 @@ def load_config():
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            config[key.strip().lower()] = value.strip()
+            key = key.strip().lower()
+            if key == "schedule":  # may appear several times
+                schedules.append(value.strip())
+            else:
+                config[key] = value.strip()
     except OSError:
         pass
+    if not schedules:
+        schedules = [DEFAULT_CONFIG["schedule"]]
+    config["schedules"] = [x for x in schedules if x.lower() not in ("", "off", "none", "false")]
     return config
+
+
+def parse_schedule(text):
+    """'weekdays 21:00 Rutina de la noche' -> ({0,1,2,3,4}, 21, 0, 'Rutina de la noche')"""
+    parts = text.split(None, 2)
+    if len(parts) < 2:
+        return None
+    days_text, time_text = parts[0].lower(), parts[1]
+    task = parts[2].strip() if len(parts) > 2 else ""
+    named = {"weekdays": {0, 1, 2, 3, 4}, "weekends": {5, 6}, "daily": set(range(7)),
+             "everyday": set(range(7))}
+    if days_text in named:
+        days = named[days_text]
+    else:
+        days = set()
+        for chunk in days_text.split(","):
+            if "-" in chunk:  # a range like mon-fri
+                a, b = chunk.split("-", 1)
+                if a not in WEEKDAY_NAMES or b not in WEEKDAY_NAMES:
+                    return None
+                i, j = WEEKDAY_NAMES.index(a), WEEKDAY_NAMES.index(b)
+                days |= set(range(i, j + 1)) if i <= j else set(range(i, 7)) | set(range(0, j + 1))
+            elif chunk in WEEKDAY_NAMES:
+                days.add(WEEKDAY_NAMES.index(chunk))
+            else:
+                return None
+    try:
+        hour, minute = (int(x) for x in time_text.split(":"))
+        dt.time(hour, minute)
+    except ValueError:
+        return None
+    return days, hour, minute, task
+
+
+def due_schedules(schedules, now, already_fired):
+    """Schedules that should run now (on time or up to 30 minutes late) and
+    have not run today. Returns a list of (fired_key, task)."""
+    due = []
+    for text in schedules:
+        parsed = parse_schedule(text)
+        if parsed is None:
+            continue
+        days, hour, minute, task = parsed
+        if now.weekday() not in days:
+            continue
+        start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        key = (now.date(), text)
+        if start <= now < start + dt.timedelta(minutes=SCHEDULE_GRACE_MINUTES) and key not in already_fired:
+            due.append((key, task))
+    return due
 
 
 def config_bool(config, key):
@@ -547,6 +622,8 @@ class FiveApp:
         self.root.title("Five")
         self.tray = None
         self.hotkey = None
+        self.fired_schedules = set()
+        self.pending_task = None
 
     # Called from the keyboard thread: never touch tkinter here
     def request_show(self):
@@ -566,7 +643,24 @@ class FiveApp:
         if "--now" in sys.argv:  # show the countdown right away (handy for testing)
             self.events.put("show")
         self.root.after(50, self._poll)
+        self.root.after(2000, self._check_schedules)
         self.root.mainloop()
+
+    def _check_schedules(self):
+        if self.root is None:
+            return
+        try:
+            schedules = load_config()["schedules"]
+            for key, task in due_schedules(schedules, dt.datetime.now(), self.fired_schedules):
+                self.fired_schedules.add(key)
+                self.pending_task = task or None
+                self.pending_scheduled = True
+            if getattr(self, "pending_scheduled", False) and self.window is None:
+                self.pending_scheduled = False
+                self.show(task=self.pending_task or "")
+        except Exception:
+            log_error(traceback.format_exc())
+        self.root.after(15000, self._check_schedules)
 
     def _poll(self):
         try:
@@ -610,7 +704,9 @@ class FiveApp:
         self.root.destroy()
         self.root = None
 
-    def show(self):
+    def show(self, task=None):
+        """task=None: normal hotkey flow. task='...': scheduled, starts the
+        countdown right away with that task ('' = random from your list)."""
         if self.window is not None:  # already on screen
             return
         tk = self.tk
@@ -642,7 +738,10 @@ class FiveApp:
         w.protocol("WM_DELETE_WINDOW", lambda: self.finish("skipped"))
 
         self._grab_focus()
-        if config_bool(self.config, "ask_task"):
+        if task is not None:
+            self.typed_task = task
+            self.start_countdown()
+        elif config_bool(self.config, "ask_task"):
             self.ask_task()
         else:
             self.start_countdown()

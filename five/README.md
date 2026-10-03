@@ -49,6 +49,12 @@ A partir de ahí, **Five se abre solo cada vez que prendes Windows**.
   - `ask_task=true`: Five te pregunta tu tarea antes de la cuenta regresiva. Con `false` siempre elige
     una acción al azar de `actions.txt`.
 
+  - `schedule=weekdays 21:00 Rutina de la noche`: de lunes a viernes a las 9 pm Five se abre solo y empieza
+    la cuenta regresiva con "Rutina de la noche", sin que toques nada. Formato: `DÍAS HORA TAREA`.
+    Días: `weekdays` (lun–vie), `weekends`, `daily` o una lista como `mon,wed,fri`. Hora en formato
+    24 h (21:00 = 9 pm). Puedes poner varias líneas `schedule=`. Si el computador estaba apagado o
+    suspendido, igual se ejecuta hasta 30 minutos tarde. `schedule=off` lo desactiva.
+
   Los cambios de `hotkey` y `autostart` necesitan reiniciar Five (clic derecho en el
   ícono → **Quit** y después doble clic en `run.bat`). Los demás funcionan desde la siguiente cuenta regresiva.
 

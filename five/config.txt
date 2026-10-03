@@ -18,3 +18,10 @@ autostart=true
 # (leave it empty and press Enter to get a random action from actions.txt)
 # false = always pick a random action from actions.txt
 ask_task=true
+
+# Automatic countdowns, no hotkey needed: DAYS TIME TASK
+# DAYS: weekdays (Mon-Fri), weekends, daily, or a list like mon,wed,fri
+# TIME: 24-hour clock, 21:00 = 9 pm. You can add more schedule= lines.
+# If the computer was off or asleep, it still runs up to 30 minutes late.
+# schedule=off turns it off.
+schedule=weekdays 21:00 Rutina de la noche
