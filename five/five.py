@@ -32,6 +32,13 @@ ERROR_FILE = APP_DIR / "five_error.log"
 
 IS_WINDOWS = sys.platform == "win32"
 
+# Bump this every time a new Five.zip is sent, so "Update Five" knows it is newer
+VERSION = "1.2"
+
+# Files that "Update Five" may replace. Your actions.txt, config.txt and
+# log.csv are never touched.
+PROGRAM_FILES = ["five.py", "run.bat", "setup.bat", "README.md"]
+
 DEFAULT_CONFIG = {
     "hotkey": "ctrl+alt+5",
     "countdown_seconds": "5",
@@ -256,6 +263,92 @@ def open_file(path):
         subprocess.Popen(["xdg-open", str(path)])
 
 
+# --------------------------------------------------------------------------
+# Updating from a Five.zip in the Downloads folder (no internet needed)
+# --------------------------------------------------------------------------
+
+def downloads_folders():
+    folders = []
+    if IS_WINDOWS:
+        try:  # the real Downloads folder, even if it was moved (e.g. to OneDrive)
+            import ctypes
+            from ctypes import wintypes
+            from uuid import UUID
+
+            class GUID(ctypes.Structure):
+                _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                            ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+            u = UUID("374DE290-123F-4565-9164-39C4925E467B")  # FOLDERID_Downloads
+            guid = GUID(u.fields[0], u.fields[1], u.fields[2],
+                        (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+            path = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None,
+                                                          ctypes.byref(path)) == 0:
+                folders.append(Path(path.value))
+                ctypes.windll.ole32.CoTaskMemFree(path)
+        except Exception:
+            pass
+    home = Path.home()
+    folders += [home / "Downloads", home / "Descargas", home / "OneDrive" / "Downloads",
+                APP_DIR.parent]
+    return [f for f in dict.fromkeys(folders) if f.is_dir()]
+
+
+def version_tuple(text):
+    try:
+        return tuple(int(x) for x in text.split("."))
+    except (AttributeError, ValueError):
+        return (0,)
+
+
+def find_update_zip():
+    """Newest Five*.zip in Downloads. Browsers rename copies to 'Five (1).zip'."""
+    zips = []
+    for folder in downloads_folders():
+        zips += [z for z in folder.glob("*.zip") if z.name.lower().startswith("five")]
+    return max(zips, key=lambda z: z.stat().st_mtime) if zips else None
+
+
+def install_update():
+    """Copy the program files from the newest Five.zip over this folder.
+    Returns (updated, message)."""
+    import re
+    import shutil
+    import zipfile
+
+    zip_path = find_update_zip()
+    if zip_path is None:
+        return False, ("I couldn't find a Five.zip in your Downloads folder.\n\n"
+                       "Download the new Five.zip first, then try again.")
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            # The files may be inside a "five/" folder in the zip, or at the top
+            names = {Path(n).name: n for n in z.namelist() if Path(n).name in PROGRAM_FILES}
+            if "five.py" not in names:
+                return False, f"{zip_path.name} doesn't look like a Five update (no five.py inside)."
+            new_code = z.read(names["five.py"])
+            compile(new_code, "five.py", "exec")  # refuse a broken file
+            found = re.search(rb'^VERSION = "([0-9.]+)"', new_code, re.M)
+            new_version = found.group(1).decode() if found else "0"
+            if version_tuple(new_version) <= version_tuple(VERSION):
+                return False, (f"You already have the newest version ({VERSION}).\n\n"
+                               f"({zip_path.name} has version {new_version}.)")
+            shutil.copy2(APP_DIR / "five.py", APP_DIR / "five.py.bak")  # just in case
+            for name, member in names.items():
+                (APP_DIR / name).write_bytes(z.read(member))
+    except (zipfile.BadZipFile, SyntaxError, OSError) as exc:
+        log_error("Update failed:\n" + traceback.format_exc())
+        return False, f"The update failed, nothing was changed.\n\n{exc}"
+    return True, f"Five was updated from version {VERSION} to {new_version}.\n\nIt will restart now."
+
+
+def restart_five():
+    args = [str(pythonw_path()), str(Path(__file__).resolve()), "--after-update"]
+    flags = subprocess.DETACHED_PROCESS if IS_WINDOWS else 0
+    subprocess.Popen(args, creationflags=flags, close_fds=True)
+
+
 def open_stats_window():
     args = [str(python_console_path()), str(Path(__file__).resolve()), "--stats", "--pause"]
     if IS_WINDOWS:
@@ -271,20 +364,39 @@ def open_stats_window():
 _instance_lock = None
 
 
-def acquire_single_instance():
+def acquire_single_instance(wait_seconds=0):
+    """True if no other Five is running. After an update, wait for the old
+    copy to finish closing."""
+    import time
+    deadline = time.time() + wait_seconds
+    while True:
+        if _try_lock():
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.3)
+
+
+def _try_lock():
     global _instance_lock
     if IS_WINDOWS:
         import ctypes
-        _instance_lock = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\FiveApp5SecondRule")
-        return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\FiveApp5SecondRule")
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return False
+        _instance_lock = handle
+        return True
     import fcntl
     import tempfile
-    _instance_lock = open(Path(tempfile.gettempdir()) / "five_app.lock", "w")
+    lock_file = open(Path(tempfile.gettempdir()) / "five_app.lock", "w")
     try:
-        fcntl.flock(_instance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        lock_file.close()
         return False
+    _instance_lock = lock_file
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -385,6 +497,7 @@ def start_tray(events):
     menu = pystray.Menu(
         pystray.MenuItem("Open stats", lambda: events.put("stats")),
         pystray.MenuItem("Edit actions", lambda: events.put("edit")),
+        pystray.MenuItem("Update Five", lambda: events.put("update")),
         pystray.MenuItem("Quit", lambda: events.put("quit")),
     )
     icon = pystray.Icon("Five", make_icon_image(), "Five - Ctrl+Alt+5", menu)
@@ -437,6 +550,10 @@ class FiveApp:
                     self.show()
                 elif event == "stats":
                     open_stats_window()
+                elif event == "update":
+                    self.update()
+                    if self.root is None:
+                        return
                 elif event == "edit":
                     open_file(ACTIONS_FILE)
                 elif event == "quit":
@@ -448,12 +565,24 @@ class FiveApp:
             log_error(traceback.format_exc())
         self.root.after(50, self._poll)
 
+    def update(self):
+        from tkinter import messagebox
+        self.root.attributes("-topmost", True)  # so the message isn't hidden
+        updated, message = install_update()
+        if not updated:
+            messagebox.showinfo("Five", message, parent=self.root)
+            return
+        messagebox.showinfo("Five", message, parent=self.root)
+        restart_five()  # the new copy waits until this one has closed
+        self.quit()
+
     def quit(self):
         if self.hotkey:
             self.hotkey.stop()
         if self.tray:
             self.tray.stop()
         self.root.destroy()
+        self.root = None
 
     def show(self):
         if self.window is not None:  # already on screen
@@ -584,7 +713,7 @@ def main():
     if "--stats" in sys.argv:
         print_stats(pause="--pause" in sys.argv)
         return
-    if not acquire_single_instance():
+    if not acquire_single_instance(wait_seconds=15 if "--after-update" in sys.argv else 0):
         try:
             import tkinter as tk
             from tkinter import messagebox

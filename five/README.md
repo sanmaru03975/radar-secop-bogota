@@ -32,6 +32,7 @@ A partir de ahí, **Five se abre solo cada vez que prendes Windows**.
 | **Esc** | Se cierra y queda anotado como `skipped` en `log.csv` |
 | Clic derecho en el ícono **5** → **Open stats** | Te muestra tus estadísticas |
 | Clic derecho → **Edit actions** | Abre tu lista de acciones en el Bloc de notas |
+| Clic derecho → **Update Five** | Instala la versión nueva de Five (ver abajo) |
 | Clic derecho → **Quit** | Cierra Five (hasta que lo vuelvas a abrir con `run.bat`) |
 
 ## Archivos que puedes editar (con el Bloc de notas)
@@ -48,6 +49,15 @@ A partir de ahí, **Five se abre solo cada vez que prendes Windows**.
 
   Los cambios de `hotkey` y `autostart` necesitan reiniciar Five (clic derecho en el
   ícono → **Quit** y después doble clic en `run.bat`). Los demás funcionan desde la siguiente cuenta regresiva.
+
+## Cómo actualizar Five
+
+1. Descarga el nuevo `Five.zip` (déjalo en **Descargas**, no hace falta extraerlo).
+2. Clic derecho en el ícono **5** → **Update Five**.
+
+Five busca el zip más nuevo en Descargas, cambia solo sus archivos de programa (`five.py`, `run.bat`,
+`setup.bat`, `README.md`) y se reinicia solo. **Tu `actions.txt`, tu `config.txt` y tu `log.csv` no se tocan.**
+Guarda una copia de la versión anterior como `five.py.bak`, por si acaso.
 
 ## Archivos que crea Five
 
