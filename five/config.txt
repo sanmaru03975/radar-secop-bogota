@@ -1,0 +1,15 @@
+# Five settings. Change the value after the = sign and save.
+# hotkey and autostart need a restart of Five (tray > Quit, then run.bat).
+# Lines that start with # are ignored.
+
+# Global hotkey. Examples: ctrl+alt+5, ctrl+shift+f, ctrl+alt+f9
+hotkey=ctrl+alt+5
+
+# How many seconds the countdown lasts (5 = 5, 4, 3, 2, 1, GO)
+countdown_seconds=5
+
+# true = close all Chrome and Edge windows at GO
+close_browser=false
+
+# true = start Five automatically when Windows starts
+autostart=true
