@@ -26,7 +26,9 @@ A partir de ahí, **Five se abre solo cada vez que prendes Windows**.
 
 | Qué haces | Qué pasa |
 |---|---|
-| **Ctrl + Alt + 5** (en cualquier programa) | Te pregunta *"What do you need to do?"*. Escribe tu tarea y presiona **Enter** (si lo dejas vacío, Five elige una acción al azar de `actions.txt`). Luego empieza la cuenta regresiva |
+| **Ctrl + Alt + 5** (en cualquier programa) | Te pregunta *"What do you need to do?"*. Puedes: **escribir** tu tarea y presionar **Enter**, hacer clic en **⚄ Random** (una acción al azar de tu lista), o hacer clic en **una acción de tu lista**. Luego empieza la cuenta regresiva |
+| **+ Save to my list** | Guarda lo que escribiste en tu lista |
+| **✕** junto a una acción | La borra de tu lista |
 | **Esc** en la pregunta | Cancela sin anotar nada |
 | Clic en **Done** o **Enter** | Se cierra y queda anotado como `done` en `log.csv` |
 | **Esc** | Se cierra y queda anotado como `skipped` en `log.csv` |

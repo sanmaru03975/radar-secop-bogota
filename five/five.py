@@ -33,7 +33,7 @@ ERROR_FILE = APP_DIR / "five_error.log"
 IS_WINDOWS = sys.platform == "win32"
 
 # Bump this every time a new Five.zip is sent, so "Update Five" knows it is newer
-VERSION = "1.2"
+VERSION = "1.3"
 
 # Files that "Update Five" may replace. Your actions.txt, config.txt and
 # log.csv are never touched.
@@ -128,13 +128,39 @@ def config_seconds(config):
         return 5
 
 
-def load_actions():
+def read_actions():
     try:
         text = ACTIONS_FILE.read_text(encoding="utf-8-sig")
     except OSError:
         text = ""
-    actions = [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
-    return actions or ["Add your actions to actions.txt"]
+    return [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+
+def load_actions():
+    return read_actions() or ["Add your actions to actions.txt"]
+
+
+def add_action(action):
+    action = action.strip()
+    if not action or action in read_actions():
+        return
+    try:
+        old = ACTIONS_FILE.read_text(encoding="utf-8-sig")
+    except OSError:
+        old = ""
+    if old and not old.endswith("\n"):
+        old += "\n"
+    ACTIONS_FILE.write_text(old + action + "\n", encoding="utf-8")
+
+
+def remove_action(action):
+    """Delete the first line that matches `action`; comments stay as they are."""
+    lines = ACTIONS_FILE.read_text(encoding="utf-8-sig").splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == action:
+            del lines[i]
+            break
+    ACTIONS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def append_log(result, action, when=None):
@@ -622,29 +648,94 @@ class FiveApp:
             self.start_countdown()
 
     def ask_task(self):
-        """First screen: you type the task you are avoiding."""
+        """First screen: type your task, roll a random one, or pick from your list."""
         tk = self.tk
         self.asking = True
-        self.question = tk.Label(self.window, text="What do you need to do?",
-                                 font=(FONT, 40, "bold"), fg=FG, bg=BG)
-        self.question.place(relx=0.5, rely=0.35, anchor="center")
-        self.entry = tk.Entry(self.window, font=(FONT, 32), width=36, justify="center",
+        self.ask_frame = tk.Frame(self.window, bg=BG)
+        self.ask_frame.place(relx=0.5, rely=0.45, anchor="center")
+        f = self.ask_frame
+
+        tk.Label(f, text="What do you need to do?", font=(FONT, 40, "bold"),
+                 fg=FG, bg=BG).pack(pady=(0, 20))
+        self.entry = tk.Entry(f, font=(FONT, 30), width=36, justify="center",
                               fg=FG, bg="#1f1f1f", insertbackground=FG, relief="flat")
-        self.entry.place(relx=0.5, rely=0.5, anchor="center", height=70)
-        self.ask_hint = tk.Label(self.window,
-                                 text="Type it and press Enter     (empty = random action)     Esc = cancel",
-                                 font=(FONT, 14), fg="#666666", bg=BG)
-        self.ask_hint.place(relx=0.5, rely=0.62, anchor="center")
+        self.entry.pack(ipady=12)
         self.entry.bind("<Return>", self.task_entered)
         self.entry.bind("<KP_Enter>", self.task_entered)
+
+        buttons = tk.Frame(f, bg=BG)
+        buttons.pack(pady=18)
+        self._button(buttons, "Start  ⏎", self.task_entered, primary=True).pack(side="left", padx=8)
+        self._button(buttons, "⚄  Random", self.pick_random).pack(side="left", padx=8)
+        self._button(buttons, "+  Save to my list", self.save_typed).pack(side="left", padx=8)
+
+        tk.Label(f, text="MY LIST  (click one to start it)", font=(FONT, 13, "bold"),
+                 fg="#888888", bg=BG).pack(pady=(18, 6))
+        self.list_frame = tk.Frame(f, bg=BG)
+        self.list_frame.pack()
+        self.draw_list()
+
+        tk.Label(f, text="Enter = start     empty = random     Esc = cancel",
+                 font=(FONT, 12), fg="#555555", bg=BG).pack(pady=(18, 0))
+
         self.entry.focus_force()
         self.window.after(200, lambda: self.window is not None and self.asking and self.entry.focus_force())
 
+    def _button(self, parent, text, command, primary=False, small=False):
+        return self.tk.Button(parent, text=text, command=command, relief="flat", cursor="hand2",
+                              font=(FONT, 12 if small else 16, "bold" if primary else "normal"),
+                              fg=BG if primary else FG, bg=ACCENT if primary else "#262626",
+                              activebackground=FG, activeforeground=BG,
+                              padx=8 if small else 18, pady=2 if small else 8)
+
+    MAX_SHOWN = 10
+
+    def draw_list(self):
+        tk = self.tk
+        for widget in self.list_frame.winfo_children():
+            widget.destroy()
+        actions = read_actions()
+        if not actions:
+            tk.Label(self.list_frame, text="Your list is empty. Type something and press  + Save to my list",
+                     font=(FONT, 13), fg="#666666", bg=BG).pack()
+            return
+        for action in actions[:self.MAX_SHOWN]:
+            row = tk.Frame(self.list_frame, bg=BG)
+            row.pack(fill="x", pady=2)
+            self.tk.Button(row, text=action, anchor="w", width=40, relief="flat", cursor="hand2",
+                           font=(FONT, 14), fg=FG, bg="#1a1a1a", activebackground=ACCENT,
+                           activeforeground=BG, padx=12, pady=4,
+                           command=lambda a=action: self.start_with(a)).pack(side="left")
+            self._button(row, "✕", lambda a=action: self.delete_from_list(a), small=True).pack(side="left", padx=(6, 0))
+        if len(actions) > self.MAX_SHOWN:
+            tk.Label(self.list_frame, text=f"+ {len(actions) - self.MAX_SHOWN} more (Random can pick them too)",
+                     font=(FONT, 12), fg="#666666", bg=BG).pack(pady=(4, 0))
+
+    def save_typed(self):
+        add_action(self.entry.get())
+        self.entry.delete(0, "end")
+        self.draw_list()
+        self.entry.focus_set()
+
+    def delete_from_list(self, action):
+        remove_action(action)
+        self.draw_list()
+        self.entry.focus_set()
+
+    def pick_random(self):
+        self.start_with("")
+
+    def start_with(self, task):
+        self.entry.delete(0, "end")
+        self.entry.insert(0, task)
+        self.task_entered()
+
     def task_entered(self, event=None):
+        if not self.asking:
+            return "break"
         self.typed_task = self.entry.get().strip()
         self.asking = False
-        for widget in (self.question, self.entry, self.ask_hint):
-            widget.destroy()
+        self.ask_frame.destroy()
         self.window.focus_force()
         self.start_countdown()
         return "break"  # don't let this Enter also press "Done"
